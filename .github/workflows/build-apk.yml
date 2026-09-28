@@ -1,4 +1,5 @@
 name: Build APK
+# Fork validation workflow for the manual-sync diagnostic build.
 
 on:
   push:
