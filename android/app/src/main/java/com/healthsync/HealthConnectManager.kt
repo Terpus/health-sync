@@ -88,7 +88,6 @@ class HealthConnectManager(private val context: Context) {
         LeanBodyMassRecord::class,
         MenstruationFlowRecord::class,
         MenstruationPeriodRecord::class,
-        MindfulnessSessionRecord::class,
         NutritionRecord::class,
         OvulationTestRecord::class,
         OxygenSaturationRecord::class,
