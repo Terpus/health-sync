@@ -18,6 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.health.connect.client.PermissionController
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -52,7 +53,8 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        healthManager = HealthConnectManager(this)
+        SyncDiagnostics.installCrashHandler(applicationContext)
+        healthManager = HealthConnectManager(applicationContext)
         statusText = findViewById(R.id.statusText)
         findViewById<ViewGroup>(R.id.contentStack).scheduleLayoutAnimation()
         findViewById<View>(R.id.contentRoot).animate()
@@ -100,36 +102,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.btnSyncNow).setOnClickListener {
-            lifecycleScope.launch {
-                if (!healthManager.hasPermissions()) {
-                    updateStatus("Step 1: Connect Health Connect first. Opening Health Connect settings...")
-                    openHealthConnectPermissions()
-                    return@launch
-                }
-                if (!DriveClient.hasFile(this@MainActivity)) {
-                    updateStatus("Step 2: Connect Google Drive first.")
-                    return@launch
-                }
-                updateStatus("Syncing to Google Drive...")
-                try {
-                    val snapshot = healthManager.readTodaySnapshot()
-                    withContext(Dispatchers.IO) {
-                        DriveClient.syncSnapshot(applicationContext, snapshot)
-                    }
-                    val rawRecordCount = snapshot.rawRecords.values.sumOf { it.size }
-                    val rawTypeCount = snapshot.rawRecords.count { it.value.isNotEmpty() }
-                    updateStatus(
-                        "Synced to Drive!\n" +
-                        "Steps: ${snapshot.steps ?: "--"}\n" +
-                        "HR: ${snapshot.heartRateAvg ?: "--"} bpm\n" +
-                        "Calories: ${snapshot.caloriesTotal ?: "--"} kcal\n" +
-                        "Sleep: ${snapshot.sleepDurationMinutes?.let { "${it / 60}h ${it % 60}m" } ?: "--"}\n" +
-                        "Raw records: $rawRecordCount across $rawTypeCount types"
-                    )
-                } catch (e: Exception) {
-                    updateStatus("Sync failed: ${e.message}")
-                }
-            }
+            runManualSync(toDrive = true)
+        }
+
+        findViewById<Button>(R.id.btnExportLocal).setOnClickListener {
+            runManualSync(toDrive = false)
         }
 
         findViewById<Button>(R.id.btnSchedule).setOnClickListener {
@@ -159,11 +136,107 @@ class MainActivity : AppCompatActivity() {
         if (requestCode == RC_DRIVE_FILE) {
             val uri = data?.data
             if (resultCode == RESULT_OK && uri != null) {
-                DriveClient.saveFileUri(this, uri, data.flags)
-                updateStatus("Google Drive file connected.\nYour file: health_data.json")
-                refreshStatusDisplay()
+                try {
+                    DriveClient.saveFileUri(this, uri, data.flags)
+                    updateStatus(
+                        "Google Drive file connected.\n" +
+                            DriveClient.describeFileAccess(this)
+                    )
+                    refreshStatusDisplay()
+                } catch (t: Throwable) {
+                    SyncDiagnostics.error(applicationContext, "save_drive_uri", t)
+                    updateStatus(
+                        "Drive connection failed: ${t.javaClass.simpleName}: " +
+                            "${t.message ?: "<no message>"}"
+                    )
+                }
             } else {
                 updateStatus("Google Drive file selection cancelled.")
+            }
+        }
+    }
+
+    private fun runManualSync(toDrive: Boolean) {
+        lifecycleScope.launch {
+            if (!healthManager.hasPermissions()) {
+                updateStatus("Step 1: Connect Health Connect first. Opening Health Connect settings...")
+                openHealthConnectPermissions()
+                return@launch
+            }
+            if (toDrive && !DriveClient.hasFile(this@MainActivity)) {
+                updateStatus(
+                    "Step 2: Connect Google Drive again. " +
+                        "The saved document URI is missing or no longer has persisted write access."
+                )
+                return@launch
+            }
+
+            val appContext = applicationContext
+            val mode = if (toDrive) "manual-drive" else "manual-local"
+            SyncDiagnostics.start(appContext, mode)
+            updateStatus(
+                if (toDrive) "Syncing to Google Drive..."
+                else "Testing Health Connect export to local Downloads..."
+            )
+
+            var stage = "starting"
+            try {
+                val (snapshot, result) = withContext(Dispatchers.IO) {
+                    if (toDrive) {
+                        stage = "drive_access"
+                        SyncDiagnostics.log(
+                            appContext,
+                            "Drive access before sync: ${DriveClient.describeFileAccess(appContext)}"
+                        )
+                    }
+
+                    stage = "health_connect_extraction"
+                    SyncDiagnostics.memory(appContext, "before extraction")
+                    val extracted = healthManager.readTodaySnapshot { message ->
+                        SyncDiagnostics.log(appContext, message)
+                    }
+                    SyncDiagnostics.memory(appContext, "after extraction")
+
+                    val rawRecordCount = extracted.rawRecords.values.sumOf { it.size }
+                    val rawTypeCount = extracted.rawRecords.count { it.value.isNotEmpty() }
+                    SyncDiagnostics.log(
+                        appContext,
+                        "extraction summary: rawRecords=$rawRecordCount rawTypes=$rawTypeCount " +
+                            "errors=${extracted.extractionErrors.size}"
+                    )
+
+                    stage = if (toDrive) "drive_serialization_write" else "local_serialization_write"
+                    val written = if (toDrive) {
+                        DriveClient.syncSnapshot(appContext, extracted)
+                    } else {
+                        DriveClient.exportLocalDownload(appContext, extracted)
+                    }
+                    SyncDiagnostics.memory(appContext, "after write")
+                    extracted to written
+                }
+
+                val rawRecordCount = snapshot.rawRecords.values.sumOf { it.size }
+                val rawTypeCount = snapshot.rawRecords.count { it.value.isNotEmpty() }
+                val destination = if (toDrive) "Google Drive" else result.destination
+                updateStatus(
+                    "Export complete: $destination\n" +
+                        "Bytes: ${result.bytesWritten}\n" +
+                        "Steps: ${snapshot.steps ?: "--"}\n" +
+                        "HR: ${snapshot.heartRateAvg ?: "--"} bpm\n" +
+                        "Calories: ${snapshot.caloriesTotal ?: "--"} kcal\n" +
+                        "Sleep: ${snapshot.sleepDurationMinutes?.let { "${it / 60}h ${it % 60}m" } ?: "--"}\n" +
+                        "Raw records: $rawRecordCount across $rawTypeCount types\n" +
+                        "Diagnostics: ${SyncDiagnostics.file(appContext).absolutePath}"
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                SyncDiagnostics.error(appContext, stage, t)
+                updateStatus(
+                    "Sync failed during $stage\n" +
+                        "${t.javaClass.name}: ${t.message ?: "<no message>"}\n" +
+                        "Diagnostics: ${SyncDiagnostics.file(appContext).absolutePath}"
+                )
             }
         }
     }

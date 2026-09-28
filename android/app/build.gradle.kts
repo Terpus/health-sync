@@ -11,8 +11,8 @@ android {
         applicationId = "com.healthsync"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.0.2-diagnostic"
     }
 
     signingConfigs {
@@ -53,7 +53,7 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 
     // Health Connect
-    implementation("androidx.health.connect:connect-client:1.1.0-alpha11")
+    implementation("androidx.health.connect:connect-client:1.1.0")
 
     // WorkManager for background sync
     implementation("androidx.work:work-runtime-ktx:2.9.0")

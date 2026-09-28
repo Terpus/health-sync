@@ -109,6 +109,16 @@
             app:iconTint="@android:color/white" />
 
         <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnExportLocal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="Test Local Export"
+            app:backgroundTint="@color/drive_blue"
+            app:icon="@drawable/ic_sync"
+            app:iconTint="@android:color/white" />
+
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnSchedule"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

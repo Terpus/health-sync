@@ -1,9 +1,25 @@
 package com.healthsync
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.util.JsonReader
+import android.util.JsonToken
+import android.util.JsonWriter
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.EOFException
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.FileNotFoundException
+import java.io.IOException
+import java.io.OutputStream
 import java.time.LocalDate
 
 object DriveClient {
@@ -13,14 +29,25 @@ object DriveClient {
     private const val PREFS = "health_sync"
     private const val KEY_FILE_URI = "drive_file_uri"
 
+    data class SyncResult(
+        val destination: String,
+        val bytesWritten: Long
+    )
+
     fun hasFile(context: Context): Boolean {
-        return fileUri(context) != null
+        val uri = fileUri(context) ?: return false
+        return context.contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isWritePermission
+        }
     }
 
     fun saveFileUri(context: Context, uri: Uri, flags: Int) {
         val persistFlags = flags and (
             Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
         )
+        require(persistFlags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION != 0) {
+            "The selected document did not grant write access."
+        }
         context.contentResolver.takePersistableUriPermission(uri, persistFlags)
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
@@ -28,13 +55,39 @@ object DriveClient {
             .apply()
     }
 
-    fun syncSnapshot(context: Context, snapshot: HealthSnapshot) {
-        val summaryEntry = snapshotToJson(snapshot, includeRawRecords = false)
-        val fullEntry = snapshotToJson(snapshot, includeRawRecords = true)
+    fun describeFileAccess(context: Context): String {
+        val uri = fileUri(context) ?: return "uri=<none>; persistedRead=false; persistedWrite=false"
+        val permission = context.contentResolver.persistedUriPermissions.firstOrNull { it.uri == uri }
+        var displayName: String? = null
+        var size: Long? = null
+        runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (nameIndex >= 0) displayName = cursor.getString(nameIndex)
+                    if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+                }
+            }
+        }
+        return "uri=$uri; persistedRead=${permission?.isReadPermission == true}; " +
+            "persistedWrite=${permission?.isWritePermission == true}; " +
+            "name=${displayName ?: "<unknown>"}; size=${size ?: -1}"
+    }
+
+    fun syncSnapshot(context: Context, snapshot: HealthSnapshot): SyncResult {
         val uri = fileUri(context)
             ?: throw Exception("Google Drive file not connected. Tap 'Connect Google Drive' first.")
 
-        val existing = readFile(context, uri)
+        SyncDiagnostics.log(context, "Drive access: ${describeFileAccess(context)}")
+        val summaryEntry = snapshotToJson(snapshot, includeRawRecords = false)
+        val existing = readSummaryFile(context, uri)
         val updated = if (existing != null) {
             mergeEntry(existing, summaryEntry, snapshot)
         } else {
@@ -43,12 +96,74 @@ object DriveClient {
                     put("device_id", snapshot.deviceId)
                     put("last_updated", snapshot.recordedAt)
                 })
-                put("snapshots", org.json.JSONArray().put(summaryEntry))
+                put("snapshots", JSONArray().put(summaryEntry))
             }
         }
-        updated.put("latest_full_export", fullEntry)
 
-        writeFile(context, uri, updated)
+        SyncDiagnostics.memory(context, "before serialization")
+        val tempFile = serializeToTempFile(context, updated, snapshot)
+        SyncDiagnostics.log(context, "serialization complete; bytes=${tempFile.length()}")
+        SyncDiagnostics.memory(context, "after serialization")
+        try {
+            copyTempToUri(context, tempFile, uri)
+            SyncDiagnostics.log(context, "document write complete")
+            return SyncResult(uri.toString(), tempFile.length())
+        } finally {
+            tempFile.delete()
+        }
+    }
+
+    fun exportLocalDownload(context: Context, snapshot: HealthSnapshot): SyncResult {
+        val summaryEntry = snapshotToJson(snapshot, includeRawRecords = false)
+        val root = JSONObject().apply {
+            put("profile", JSONObject().apply {
+                put("device_id", snapshot.deviceId)
+                put("last_updated", snapshot.recordedAt)
+            })
+            put("snapshots", JSONArray().put(summaryEntry))
+        }
+
+        SyncDiagnostics.memory(context, "before local serialization")
+        val tempFile = serializeToTempFile(context, root, snapshot)
+        SyncDiagnostics.log(context, "local serialization complete; bytes=${tempFile.length()}")
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, "health_data_local_test.json")
+                    put(MediaStore.Downloads.MIME_TYPE, "application/json")
+                    put(
+                        MediaStore.Downloads.RELATIVE_PATH,
+                        Environment.DIRECTORY_DOWNLOADS + "/HealthSync"
+                    )
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = context.contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    values
+                ) ?: throw IOException("Could not create local Downloads export.")
+
+                copyTempToUri(context, tempFile, uri)
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                context.contentResolver.update(uri, values, null, null)
+                return SyncResult(
+                    "Downloads/HealthSync/health_data_local_test.json",
+                    tempFile.length()
+                )
+            }
+
+            val directory = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?: context.filesDir
+            directory.mkdirs()
+            val file = File(directory, "health_data_local_test.json")
+            FileInputStream(tempFile).use { input ->
+                FileOutputStream(file, false).use { output -> input.copyTo(output, 64 * 1024) }
+            }
+            return SyncResult(file.absolutePath, tempFile.length())
+        } finally {
+            tempFile.delete()
+        }
     }
 
     private fun fileUri(context: Context): Uri? {
@@ -76,19 +191,174 @@ object DriveClient {
         return existing
     }
 
-    private fun readFile(context: Context, uri: Uri): JSONObject? {
-        val text = context.contentResolver.openInputStream(uri)?.use { input ->
-            input.bufferedReader().readText()
-        }.orEmpty()
-        return if (text.isBlank()) null else JSONObject(text)
+    private fun readSummaryFile(context: Context, uri: Uri): JSONObject? {
+        val input = context.contentResolver.openInputStream(uri) ?: return null
+        return try {
+            JsonReader(input.bufferedReader()).use { reader ->
+                if (reader.peek() == JsonToken.END_DOCUMENT) return null
+                val root = JSONObject()
+                reader.beginObject()
+                while (reader.hasNext()) {
+                    val name = reader.nextName()
+                    if (name == "latest_full_export") {
+                        reader.skipValue()
+                    } else {
+                        root.put(name, readJsonValue(reader))
+                    }
+                }
+                reader.endObject()
+                root
+            }
+        } catch (_: EOFException) {
+            null
+        }
     }
 
-    private fun writeFile(context: Context, uri: Uri, content: JSONObject) {
-        context.contentResolver.openOutputStream(uri, "wt")?.use { output ->
-            output.writer().use { writer ->
-                writer.write(content.toString(2))
+    private fun readJsonValue(reader: JsonReader): Any {
+        return when (reader.peek()) {
+            JsonToken.BEGIN_OBJECT -> JSONObject().apply {
+                reader.beginObject()
+                while (reader.hasNext()) put(reader.nextName(), readJsonValue(reader))
+                reader.endObject()
             }
-        } ?: throw Exception("Could not open $FILE_NAME for writing.")
+            JsonToken.BEGIN_ARRAY -> JSONArray().apply {
+                reader.beginArray()
+                while (reader.hasNext()) put(readJsonValue(reader))
+                reader.endArray()
+            }
+            JsonToken.STRING -> reader.nextString()
+            JsonToken.NUMBER -> {
+                val raw = reader.nextString()
+                raw.toLongOrNull() ?: raw.toDoubleOrNull() ?: raw
+            }
+            JsonToken.BOOLEAN -> reader.nextBoolean()
+            JsonToken.NULL -> {
+                reader.nextNull()
+                JSONObject.NULL
+            }
+            else -> throw IOException("Unexpected JSON token: ${reader.peek()}")
+        }
+    }
+
+    private fun serializeToTempFile(
+        context: Context,
+        root: JSONObject,
+        snapshot: HealthSnapshot
+    ): File {
+        val temp = File.createTempFile("health_sync_", ".json", context.cacheDir)
+        try {
+            FileOutputStream(temp).bufferedWriter().use { buffered ->
+                JsonWriter(buffered).use { writer ->
+                    writer.beginObject()
+                    val keys = root.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        writer.name(key)
+                        writeJsonValue(writer, root.get(key))
+                    }
+                    writer.name("latest_full_export")
+                    writeFullSnapshot(writer, snapshot)
+                    writer.endObject()
+                }
+            }
+            return temp
+        } catch (t: Throwable) {
+            temp.delete()
+            throw t
+        }
+    }
+
+    private fun writeFullSnapshot(writer: JsonWriter, snapshot: HealthSnapshot) {
+        val summary = snapshotToJson(snapshot, includeRawRecords = false)
+        writer.beginObject()
+        val keys = summary.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            writer.name(key)
+            writeJsonValue(writer, summary.get(key))
+        }
+        writer.name("raw_records")
+        writeJsonValue(writer, snapshot.rawRecords)
+        writer.name("raw_record_counts")
+        writer.beginObject()
+        snapshot.rawRecords.forEach { (type, records) ->
+            writer.name(type).value(records.size.toLong())
+        }
+        writer.endObject()
+        writer.name("extraction_errors")
+        writeJsonValue(writer, snapshot.extractionErrors)
+        writer.endObject()
+    }
+
+    private fun writeJsonValue(writer: JsonWriter, value: Any?) {
+        when (value) {
+            null, JSONObject.NULL -> writer.nullValue()
+            is JSONObject -> {
+                writer.beginObject()
+                val keys = value.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    writer.name(key)
+                    writeJsonValue(writer, value.get(key))
+                }
+                writer.endObject()
+            }
+            is JSONArray -> {
+                writer.beginArray()
+                for (i in 0 until value.length()) writeJsonValue(writer, value.get(i))
+                writer.endArray()
+            }
+            is Map<*, *> -> {
+                writer.beginObject()
+                value.forEach { (key, item) ->
+                    writer.name(key.toString())
+                    writeJsonValue(writer, item)
+                }
+                writer.endObject()
+            }
+            is Iterable<*> -> {
+                writer.beginArray()
+                value.forEach { writeJsonValue(writer, it) }
+                writer.endArray()
+            }
+            is Array<*> -> {
+                writer.beginArray()
+                value.forEach { writeJsonValue(writer, it) }
+                writer.endArray()
+            }
+            is Boolean -> writer.value(value)
+            is Number -> writer.value(value)
+            is String -> writer.value(value)
+            else -> writer.value(value.toString())
+        }
+    }
+
+    private fun copyTempToUri(context: Context, tempFile: File, uri: Uri) {
+        FileInputStream(tempFile).use { input ->
+            openTruncatingOutputStream(context, uri).use { output ->
+                input.copyTo(output, 64 * 1024)
+                output.flush()
+            }
+        }
+    }
+
+    private fun openTruncatingOutputStream(context: Context, uri: Uri): OutputStream {
+        var lastError: Exception? = null
+        for (mode in listOf("rwt", "wt")) {
+            try {
+                context.contentResolver.openOutputStream(uri, mode)?.let {
+                    SyncDiagnostics.log(context, "opened destination with mode=$mode")
+                    return it
+                }
+            } catch (e: Exception) {
+                lastError = e
+                SyncDiagnostics.log(
+                    context,
+                    "openOutputStream mode=$mode failed: ${e.javaClass.simpleName}: ${e.message}"
+                )
+            }
+        }
+        throw IOException("Could not open $FILE_NAME for truncating write.", lastError)
     }
 
     private fun snapshotToJson(snapshot: HealthSnapshot, includeRawRecords: Boolean): JSONObject {

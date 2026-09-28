@@ -159,10 +159,15 @@ class HealthConnectManager(private val context: Context) {
         return grantedPermissions().containsAll(requiredPermissions)
     }
 
-    suspend fun readTodaySnapshot(): HealthSnapshot {
+    suspend fun readTodaySnapshot(
+        onProgress: (String) -> Unit = {}
+    ): HealthSnapshot {
         check(availability() == Availability.AVAILABLE) {
             "Health Connect is not available. Install or update Health Connect first."
         }
+
+        val granted = grantedPermissions()
+        onProgress("Health Connect permissions: ${granted.size}/${permissions.size} granted")
 
         val zone = ZoneId.systemDefault()
         val startOfDay = LocalDate.now().atStartOfDay(zone).toInstant()
@@ -177,10 +182,13 @@ class HealthConnectManager(private val context: Context) {
             now
         )
 
+        onProgress("Reading sleep/HRV/daily aggregates")
         val sleep = readOptional { readSleep(sleepRange) }
         val hrv = readOptional { readHrvStats(sleepRange) }
         val summary = readOptional { readDailySummary(todayRange) }
-        val export = readRawRecords(exportRange)
+        onProgress("Reading raw records for $EXPORT_HISTORY_DAYS days")
+        val export = readRawRecords(exportRange, granted, onProgress)
+        onProgress("Health Connect extraction complete")
 
         return HealthSnapshot(
             deviceId = android.provider.Settings.Secure.getString(
@@ -189,7 +197,7 @@ class HealthConnectManager(private val context: Context) {
             recordedAt = ZonedDateTime.now().toString(),
             exportStart = exportStart.toString(),
             exportEnd = now.toString(),
-            grantedPermissions = grantedPermissions().sorted(),
+            grantedPermissions = granted.sorted(),
             requestedRecordTypes = supportedRecordTypes.map { it.java.simpleName }.sorted(),
             steps = summary?.steps,
             caloriesActive = summary?.caloriesActive,
@@ -364,21 +372,37 @@ class HealthConnectManager(private val context: Context) {
         return kotlin.math.round(value * 10.0) / 10.0
     }
 
-    private suspend fun readRawRecords(range: TimeRangeFilter): RawExport {
+    private suspend fun readRawRecords(
+        range: TimeRangeFilter,
+        grantedPermissions: Set<String>,
+        onProgress: (String) -> Unit,
+    ): RawExport {
         val recordsByType = linkedMapOf<String, List<Map<String, Any?>>>()
         val errorsByType = linkedMapOf<String, String>()
 
         for (recordType in supportedRecordTypes) {
             val name = recordType.java.simpleName
+            val permission = HealthPermission.getReadPermission(recordType)
+            if (permission !in grantedPermissions) {
+                recordsByType[name] = emptyList()
+                errorsByType[name] = "Permission not granted"
+                onProgress("raw[$name] skipped: permission not granted")
+                continue
+            }
+
             try {
+                onProgress("raw[$name] reading")
                 val records = readRecordsUntyped(recordType, range)
                 recordsByType[name] = records.map { recordToMap(it) }
+                onProgress("raw[$name] count=${records.size}")
             } catch (e: SecurityException) {
                 recordsByType[name] = emptyList()
                 errorsByType[name] = "Permission not granted"
+                onProgress("raw[$name] security error")
             } catch (e: Exception) {
                 recordsByType[name] = emptyList()
                 errorsByType[name] = e.message ?: e.javaClass.simpleName
+                onProgress("raw[$name] error=${e.javaClass.simpleName}: ${e.message}")
             }
         }
 
