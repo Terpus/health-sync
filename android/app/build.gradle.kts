@@ -31,6 +31,8 @@ android {
 
     buildTypes {
         debug {
+            applicationIdSuffix = ".diagnostic"
+            versionNameSuffix = "-sidecar"
             signingConfig = signingConfigs.getByName("debug")
         }
         release {
