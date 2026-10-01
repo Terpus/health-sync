@@ -46,6 +46,7 @@ data class HealthSnapshot(
     val hrvRmssdMaxMs: Double?,
     val hrvRmssdSampleCount: Int,
     val selectedSummaryOrigin: String?,
+    val summarySources: Map<String, String>,
     val summaryDataOrigins: List<String>,
     val allSourcesSteps: Long?,
     val allSourcesDistanceMeters: Long?,
@@ -219,6 +220,7 @@ class HealthConnectManager(private val context: Context) {
             hrvRmssdMaxMs = hrv?.maxMs,
             hrvRmssdSampleCount = hrv?.sampleCount ?: 0,
             selectedSummaryOrigin = summary?.selectedOrigin,
+            summarySources = summary?.sources.orEmpty(),
             summaryDataOrigins = summary?.dataOrigins.orEmpty(),
             allSourcesSteps = summary?.allSourcesSteps,
             allSourcesDistanceMeters = summary?.allSourcesDistanceMeters,
@@ -246,6 +248,7 @@ class HealthConnectManager(private val context: Context) {
         val exerciseMinutes: Long?,
         val sleepDurationMinutes: Long?,
         val selectedOrigin: String?,
+        val sources: Map<String, String>,
         val dataOrigins: List<String>,
         val allSourcesSteps: Long?,
         val allSourcesDistanceMeters: Long?,
@@ -254,32 +257,84 @@ class HealthConnectManager(private val context: Context) {
 
     private suspend fun readDailySummary(range: TimeRangeFilter): DailySummary {
         val allSourcesResult = aggregateDailyMetrics(range, emptySet())
-        val selectedOrigin = chooseSummaryOrigin(range, allSourcesResult.dataOrigins)
-        val result = if (selectedOrigin != null) {
-            aggregateDailyMetrics(range, setOf(DataOrigin(selectedOrigin)))
-        } else {
-            allSourcesResult
+        val availablePackages = allSourcesResult.dataOrigins.map { it.packageName }.toSet()
+        val sourceResults = availablePackages.associateWith { packageName ->
+            aggregateDailyMetrics(range, setOf(DataOrigin(packageName)))
+        }
+
+        fun sourceFor(
+            recordType: KClass<out Record>,
+            hasValue: (String) -> Boolean
+        ): String? = prioritizedOrigins(recordType, availablePackages).firstOrNull(hasValue)
+
+        val stepsSource = sourceFor(StepsRecord::class) {
+            sourceResults[it]?.get(StepsRecord.COUNT_TOTAL) != null
+        }
+        val activeCaloriesSource = sourceFor(ActiveCaloriesBurnedRecord::class) {
+            sourceResults[it]?.get(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL) != null
+        }
+        val totalCaloriesSource = sourceFor(TotalCaloriesBurnedRecord::class) {
+            sourceResults[it]?.get(TotalCaloriesBurnedRecord.ENERGY_TOTAL) != null
+        }
+        val heartRateSource = sourceFor(HeartRateRecord::class) {
+            sourceResults[it]?.get(HeartRateRecord.BPM_AVG) != null
+        }
+        val restingHeartRateSource = sourceFor(RestingHeartRateRecord::class) {
+            sourceResults[it]?.get(RestingHeartRateRecord.BPM_AVG) != null
+        }
+        val distanceSource = sourceFor(DistanceRecord::class) {
+            sourceResults[it]?.get(DistanceRecord.DISTANCE_TOTAL) != null
+        }
+        val exerciseSource = sourceFor(ExerciseSessionRecord::class) {
+            sourceResults[it]?.get(ExerciseSessionRecord.EXERCISE_DURATION_TOTAL) != null
+        }
+        val sleepSource = sourceFor(SleepSessionRecord::class) {
+            sourceResults[it]?.get(SleepSessionRecord.SLEEP_DURATION_TOTAL) != null
+        }
+
+        val summarySources = linkedMapOf<String, String>().apply {
+            stepsSource?.let { put("steps", it) }
+            activeCaloriesSource?.let { put("calories_active_kcal", it) }
+            totalCaloriesSource?.let { put("calories_total_kcal", it) }
+            heartRateSource?.let { put("heart_rate_sample_avg_bpm", it) }
+            restingHeartRateSource?.let { put("heart_rate_resting_bpm", it) }
+            distanceSource?.let { put("distance_health_connect_km", it) }
+            exerciseSource?.let { put("exercise_session_minutes", it) }
+            sleepSource?.let { put("sleep_duration_minutes", it) }
         }
 
         return DailySummary(
-            steps = result[StepsRecord.COUNT_TOTAL],
-            caloriesActive = result[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]
+            steps = stepsSource?.let { sourceResults[it]?.get(StepsRecord.COUNT_TOTAL) }
+                ?: allSourcesResult[StepsRecord.COUNT_TOTAL],
+            caloriesActive = activeCaloriesSource
+                ?.let { sourceResults[it]?.get(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL) }
                 ?.inKilocalories
                 ?.toLong(),
-            caloriesTotal = result[TotalCaloriesBurnedRecord.ENERGY_TOTAL]
+            caloriesTotal = totalCaloriesSource
+                ?.let { sourceResults[it]?.get(TotalCaloriesBurnedRecord.ENERGY_TOTAL) }
                 ?.inKilocalories
-                ?.toLong(),
-            heartRateAvg = result[HeartRateRecord.BPM_AVG]?.toInt(),
-            heartRateResting = result[RestingHeartRateRecord.BPM_AVG]?.toInt(),
-            distanceMeters = result[DistanceRecord.DISTANCE_TOTAL]?.inMeters?.toLong(),
-            exerciseMinutes = result[ExerciseSessionRecord.EXERCISE_DURATION_TOTAL]
+                ?.toLong()
+                ?: allSourcesResult[TotalCaloriesBurnedRecord.ENERGY_TOTAL]?.inKilocalories?.toLong(),
+            heartRateAvg = heartRateSource
+                ?.let { sourceResults[it]?.get(HeartRateRecord.BPM_AVG) }
+                ?.toInt(),
+            heartRateResting = restingHeartRateSource
+                ?.let { sourceResults[it]?.get(RestingHeartRateRecord.BPM_AVG) }
+                ?.toInt(),
+            distanceMeters = distanceSource
+                ?.let { sourceResults[it]?.get(DistanceRecord.DISTANCE_TOTAL) }
+                ?.inMeters
+                ?.toLong()
+                ?: allSourcesResult[DistanceRecord.DISTANCE_TOTAL]?.inMeters?.toLong(),
+            exerciseMinutes = exerciseSource
+                ?.let { sourceResults[it]?.get(ExerciseSessionRecord.EXERCISE_DURATION_TOTAL) }
                 ?.toMinutes(),
-            sleepDurationMinutes = result[SleepSessionRecord.SLEEP_DURATION_TOTAL]
+            sleepDurationMinutes = sleepSource
+                ?.let { sourceResults[it]?.get(SleepSessionRecord.SLEEP_DURATION_TOTAL) }
                 ?.toMinutes(),
-            selectedOrigin = selectedOrigin,
-            dataOrigins = result.dataOrigins
-                .map { it.packageName }
-                .sorted(),
+            selectedOrigin = summarySources.values.distinct().singleOrNull(),
+            sources = summarySources,
+            dataOrigins = availablePackages.sorted(),
             allSourcesSteps = allSourcesResult[StepsRecord.COUNT_TOTAL],
             allSourcesDistanceMeters = allSourcesResult[DistanceRecord.DISTANCE_TOTAL]
                 ?.inMeters
@@ -310,21 +365,15 @@ class HealthConnectManager(private val context: Context) {
             )
         )
 
-    private suspend fun chooseSummaryOrigin(
-        range: TimeRangeFilter,
-        availableOrigins: Set<DataOrigin>
-    ): String? {
-        val availablePackages = availableOrigins.map { it.packageName }.toSet()
-        val preferred = PREFERRED_DAILY_SUMMARY_ORIGINS.firstOrNull { it in availablePackages }
-        if (preferred != null && originHasSteps(range, preferred)) return preferred
-
-        val originsWithSteps = availablePackages.filter { originHasSteps(range, it) }
-        return if (originsWithSteps.size == 1) originsWithSteps.first() else null
-    }
-
-    private suspend fun originHasSteps(range: TimeRangeFilter, packageName: String): Boolean {
-        val result = aggregateDailyMetrics(range, setOf(DataOrigin(packageName)))
-        return (result[StepsRecord.COUNT_TOTAL] ?: 0L) > 0L
+    private fun prioritizedOrigins(
+        recordType: KClass<out Record>,
+        availablePackages: Set<String>
+    ): List<String> {
+        val configured = SOURCE_PRIORITY_BY_RECORD_TYPE[recordType] ?: DEFAULT_SOURCE_PRIORITY
+        return (
+            configured.filter { it in availablePackages } +
+                availablePackages.filter { it !in configured }.sorted()
+            ).distinct()
     }
 
     data class RawExport(
@@ -558,10 +607,26 @@ class HealthConnectManager(private val context: Context) {
         private const val PAGE_SIZE = 500
         private const val MAX_RECORDS_PER_TYPE = 2_000
         private const val MAX_SERIALIZATION_DEPTH = 5
-        private val PREFERRED_DAILY_SUMMARY_ORIGINS = listOf(
-            "com.fitbit.FitbitMobile",
-            "com.google.android.apps.fitness",
-            "com.google.android.apps.healthdata",
+        private const val OHEALTH_INTERNATIONAL_PACKAGE = "com.heytap.health.international"
+        private const val OHEALTH_PACKAGE = "com.heytap.health"
+        private const val GOOGLE_FIT_PACKAGE = "com.google.android.apps.fitness"
+        private const val BODY_DIARY_PACKAGE = "com.selantoapps.bodydiary"
+
+        private val OHEALTH_PACKAGES = listOf(
+            OHEALTH_INTERNATIONAL_PACKAGE,
+            OHEALTH_PACKAGE,
+        )
+
+        private val DEFAULT_SOURCE_PRIORITY = OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE
+
+        // Per-record overrides make source selection configurable without changing aggregation logic.
+        // If a future smart scale writes directly to Health Connect, add its package here.
+        private val SOURCE_PRIORITY_BY_RECORD_TYPE: Map<KClass<out Record>, List<String>> = mapOf(
+            WeightRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
+            BodyFatRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
+            BodyWaterMassRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
+            BoneMassRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
+            LeanBodyMassRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
         )
     }
 }

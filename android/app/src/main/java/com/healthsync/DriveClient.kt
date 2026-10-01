@@ -372,13 +372,14 @@ object DriveClient {
             put("granted_permissions", toJsonValue(snapshot.grantedPermissions))
             put("requested_record_types", toJsonValue(snapshot.requestedRecordTypes))
             snapshot.selectedSummaryOrigin?.let { put("selected_summary_origin", it) }
+            put("summary_sources", toJsonValue(snapshot.summarySources))
             put("summary_data_origins", toJsonValue(snapshot.summaryDataOrigins))
-            put("summary_method", "Health Connect aggregate API filtered to the preferred wearable/app source when available; raw records remain typed by source record.")
+            put("summary_method", "Health Connect aggregate API with per-metric source selection. OHealth is preferred when it has that metric, then configured fallbacks such as Google Fit; raw records remain typed by source record.")
             put("analysis_guidance", JSONObject().apply {
-                put("daily_totals_authoritative_source", "Use the summary fields in this object for daily totals.")
-                put("raw_records_warning", "Do not sum raw_records to answer daily totals unless explicitly doing raw-record auditing; raw records can overlap, use UTC timestamps, and may not match Health/Fitbit local-day cards.")
+                put("daily_totals_authoritative_source", "Use the summary fields in this object for daily totals and summary_sources to see which app supplied each metric.")
+                put("raw_records_warning", "Do not sum raw_records to answer daily totals unless explicitly doing raw-record auditing; raw records can overlap, use UTC timestamps, and may not match app-local day cards.")
                 put("timezone_rule", "For user-facing sleep and day-level answers, prefer local fields and local-day summaries over UTC timestamps ending in Z.")
-                put("source_rule", "Daily totals prefer selected_summary_origin, usually the wearable app source, so steps match the visible Fitbit/Google Health card instead of mixing phone and wearable origins.")
+                put("source_rule", "Source priority is selected independently per metric. OHealth is preferred when it has data for that metric; Google Fit and other origins are fallbacks.")
             })
             put("all_sources_audit", JSONObject().apply {
                 snapshot.allSourcesSteps?.let { put("steps", it) }
@@ -386,7 +387,7 @@ object DriveClient {
                     put("distance_health_connect_km", Math.round(it / 1000.0 * 100) / 100.0)
                 }
                 snapshot.allSourcesCaloriesTotal?.let { put("calories_total_kcal", it) }
-                put("note", "Audit-only total across all Health Connect origins. Do not use this for card comparison when selected_summary_origin is present.")
+                put("note", "Audit-only aggregate across all Health Connect origins. Do not use it in place of the per-metric selected summary values.")
             })
             snapshot.steps?.let { put("steps", it) }
             snapshot.caloriesActive?.let { put("calories_active_kcal", it) }
