@@ -622,11 +622,11 @@ class HealthConnectManager(private val context: Context) {
         // Per-record overrides make source selection configurable without changing aggregation logic.
         // If a future smart scale writes directly to Health Connect, add its package here.
         private val SOURCE_PRIORITY_BY_RECORD_TYPE: Map<KClass<out Record>, List<String>> = mapOf(
-            WeightRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
-            BodyFatRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
-            BodyWaterMassRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
-            BoneMassRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
-            LeanBodyMassRecord::class to (OHEALTH_PACKAGES + BODY_DIARY_PACKAGE + GOOGLE_FIT_PACKAGE),
+            WeightRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),
+            BodyFatRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),
+            BodyWaterMassRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),
+            BoneMassRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),
+            LeanBodyMassRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),
         )
     }
 }
