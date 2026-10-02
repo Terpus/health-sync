@@ -459,8 +459,9 @@ class HealthConnectManager(private val context: Context) {
         var backfilledTypes = 0
         var usedDelta = false
 
-        for (recordType in supportedRecordTypes) {
+        for ((index, recordType) in supportedRecordTypes.withIndex()) {
             val name = recordType.java.simpleName
+            val progress = "${index + 1}/${supportedRecordTypes.size} $name"
             val permission = HealthPermission.getReadPermission(recordType)
             val key = changesTokenKey(name)
 
@@ -468,7 +469,7 @@ class HealthConnectManager(private val context: Context) {
                 recordsByType[name] = mutableListOf()
                 errorsByType[name] = "Permission not granted"
                 removeTokens += key
-                onProgress("raw[$name] skipped: permission not granted")
+                onProgress("raw[$progress] skipped: permission not granted")
                 continue
             }
 
@@ -480,7 +481,7 @@ class HealthConnectManager(private val context: Context) {
                 }
 
                 if (existingToken == null) {
-                    onProgress("raw[$name] backfill 7d")
+                    onProgress("raw[$progress] backfill 7d")
                     val newToken = client.getChangesToken(
                         ChangesTokenRequest(recordTypes = setOf(recordType))
                     )
@@ -490,7 +491,7 @@ class HealthConnectManager(private val context: Context) {
                     backfilledTypes++
                 } else {
                     usedDelta = true
-                    onProgress("raw[$name] delta")
+                    onProgress("raw[$progress] delta")
                     val current = recordsByType[name].orEmpty()
                     val byId = linkedMapOf<String, Map<String, Any?>>()
                     val withoutId = mutableListOf<Map<String, Any?>>()
@@ -531,7 +532,7 @@ class HealthConnectManager(private val context: Context) {
                     } while (hasMore)
 
                     if (tokenExpired) {
-                        onProgress("raw[$name] token expired; rebuilding 7d")
+                        onProgress("raw[$progress] token expired; rebuilding 7d")
                         val newToken = client.getChangesToken(
                             ChangesTokenRequest(recordTypes = setOf(recordType))
                         )
@@ -552,15 +553,15 @@ class HealthConnectManager(private val context: Context) {
                     .filter { recordInstant(it)?.isBefore(cutoff) != true }
                     .sortedBy { recordInstant(it)?.toEpochMilli() ?: Long.MAX_VALUE }
                     .toMutableList()
-                onProgress("raw[$name] cached=${recordsByType[name]?.size ?: 0}")
+                onProgress("raw[$progress] cached=${recordsByType[name]?.size ?: 0}")
             } catch (e: SecurityException) {
                 recordsByType[name] = mutableListOf()
                 errorsByType[name] = "Permission not granted"
                 removeTokens += key
-                onProgress("raw[$name] security error")
+                onProgress("raw[$progress] security error")
             } catch (e: Exception) {
                 errorsByType[name] = e.message ?: e.javaClass.simpleName
-                onProgress("raw[$name] error=${e.javaClass.simpleName}: ${e.message}")
+                onProgress("raw[$progress] error=${e.javaClass.simpleName}: ${e.message}")
             }
         }
 
