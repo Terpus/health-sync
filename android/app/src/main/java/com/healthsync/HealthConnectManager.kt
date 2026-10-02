@@ -4,10 +4,13 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.changes.DeletionChange
+import androidx.health.connect.client.changes.UpsertionChange
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.request.AggregateRequest
+import androidx.health.connect.client.request.ChangesTokenRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import java.lang.reflect.Method
@@ -52,6 +55,9 @@ data class HealthSnapshot(
     val allSourcesDistanceMeters: Long?,
     val allSourcesCaloriesTotal: Long?,
     val rawRecords: Map<String, List<Map<String, Any?>>>,
+    val rawSyncMode: String,
+    val rawChangesApplied: Int,
+    val rawBackfilledTypes: Int,
     val extractionErrors: Map<String, String>
 )
 
@@ -64,6 +70,9 @@ class HealthConnectManager(private val context: Context) {
     }
 
     private val client by lazy { HealthConnectClient.getOrCreate(context) }
+    private val changesPrefs by lazy {
+        context.getSharedPreferences(CHANGES_PREFS, Context.MODE_PRIVATE)
+    }
 
     private val supportedRecordTypes: List<KClass<out Record>> = listOf(
         ActiveCaloriesBurnedRecord::class,
@@ -173,7 +182,7 @@ class HealthConnectManager(private val context: Context) {
         val startOfDay = LocalDate.now().atStartOfDay(zone).toInstant()
         val now = Instant.now()
         val todayRange = TimeRangeFilter.between(startOfDay, now)
-        val exportStart = now.minusSeconds(EXPORT_HISTORY_DAYS * 24 * 60 * 60)
+        val exportStart = now.minusSeconds(ROLLING_RAW_DAYS * 24 * 60 * 60)
         val exportRange = TimeRangeFilter.between(exportStart, now)
 
         // Sleep: look back 24h to catch last night
@@ -186,7 +195,7 @@ class HealthConnectManager(private val context: Context) {
         val sleep = readOptional { readSleep(sleepRange) }
         val hrv = readOptional { readHrvStats(sleepRange) }
         val summary = readOptional { readDailySummary(todayRange) }
-        onProgress("Reading raw records for $EXPORT_HISTORY_DAYS days")
+        onProgress("Updating rolling raw window: $ROLLING_RAW_DAYS days")
         val export = readRawRecords(exportRange, granted, onProgress)
         onProgress("Health Connect extraction complete")
 
@@ -226,6 +235,9 @@ class HealthConnectManager(private val context: Context) {
             allSourcesDistanceMeters = summary?.allSourcesDistanceMeters,
             allSourcesCaloriesTotal = summary?.allSourcesCaloriesTotal,
             rawRecords = export.records,
+            rawSyncMode = export.mode,
+            rawChangesApplied = export.changesApplied,
+            rawBackfilledTypes = export.backfilledTypes,
             extractionErrors = export.errors
         )
     }
@@ -378,7 +390,10 @@ class HealthConnectManager(private val context: Context) {
 
     data class RawExport(
         val records: Map<String, List<Map<String, Any?>>>,
-        val errors: Map<String, String>
+        val errors: Map<String, String>,
+        val mode: String,
+        val changesApplied: Int,
+        val backfilledTypes: Int
     )
 
     data class HrvStats(
@@ -425,36 +440,149 @@ class HealthConnectManager(private val context: Context) {
         grantedPermissions: Set<String>,
         onProgress: (String) -> Unit,
     ): RawExport {
-        val recordsByType = linkedMapOf<String, List<Map<String, Any?>>>()
+        val cacheWasPresent = RawCacheStore.exists(context)
+        var cacheUsable = cacheWasPresent
+        val recordsByType = try {
+            RawCacheStore.load(context)
+        } catch (t: Throwable) {
+            cacheUsable = false
+            RawCacheStore.clear(context)
+            SyncDiagnostics.error(context, "raw_cache_load", t)
+            linkedMapOf()
+        }
+
         val errorsByType = linkedMapOf<String, String>()
+        val pendingTokens = linkedMapOf<String, String>()
+        val removeTokens = linkedSetOf<String>()
+        val cutoff = Instant.now().minusSeconds(ROLLING_RAW_DAYS * 24 * 60 * 60)
+        var changesApplied = 0
+        var backfilledTypes = 0
+        var usedDelta = false
 
         for (recordType in supportedRecordTypes) {
             val name = recordType.java.simpleName
             val permission = HealthPermission.getReadPermission(recordType)
+            val key = changesTokenKey(name)
+
             if (permission !in grantedPermissions) {
-                recordsByType[name] = emptyList()
+                recordsByType[name] = mutableListOf()
                 errorsByType[name] = "Permission not granted"
+                removeTokens += key
                 onProgress("raw[$name] skipped: permission not granted")
                 continue
             }
 
             try {
-                onProgress("raw[$name] reading")
-                val records = readRecordsUntyped(recordType, range)
-                recordsByType[name] = records.map { recordToMap(it) }
-                onProgress("raw[$name] count=${records.size}")
+                val existingToken = if (cacheUsable && recordsByType.containsKey(name)) {
+                    changesPrefs.getString(key, null)
+                } else {
+                    null
+                }
+
+                if (existingToken == null) {
+                    onProgress("raw[$name] backfill 7d")
+                    val newToken = client.getChangesToken(
+                        ChangesTokenRequest(recordTypes = setOf(recordType))
+                    )
+                    val records = readRecordsUntyped(recordType, range)
+                    recordsByType[name] = records.map { recordToMap(it) }.toMutableList()
+                    pendingTokens[key] = newToken
+                    backfilledTypes++
+                } else {
+                    usedDelta = true
+                    onProgress("raw[$name] delta")
+                    val current = recordsByType[name].orEmpty()
+                    val byId = linkedMapOf<String, Map<String, Any?>>()
+                    val withoutId = mutableListOf<Map<String, Any?>>()
+                    current.forEach { record ->
+                        val id = recordId(record)
+                        if (id == null) withoutId += record else byId[id] = record
+                    }
+
+                    var token = existingToken
+                    var tokenExpired = false
+                    var hasMore: Boolean
+                    do {
+                        val response = client.getChanges(token, CHANGES_PAGE_SIZE)
+                        if (response.changesTokenExpired) {
+                            tokenExpired = true
+                            break
+                        }
+                        response.changes.forEach { change ->
+                            when (change) {
+                                is DeletionChange -> {
+                                    byId.remove(change.recordId)
+                                    changesApplied++
+                                }
+                                is UpsertionChange -> {
+                                    val record = change.record
+                                    val id = record.metadata.id
+                                    byId.remove(id)
+                                    val mapped = recordToMap(record)
+                                    if (recordInstant(mapped)?.isBefore(cutoff) != true) {
+                                        byId[id] = mapped
+                                    }
+                                    changesApplied++
+                                }
+                            }
+                        }
+                        token = response.nextChangesToken
+                        hasMore = response.hasMore
+                    } while (hasMore)
+
+                    if (tokenExpired) {
+                        onProgress("raw[$name] token expired; rebuilding 7d")
+                        val newToken = client.getChangesToken(
+                            ChangesTokenRequest(recordTypes = setOf(recordType))
+                        )
+                        val records = readRecordsUntyped(recordType, range)
+                        recordsByType[name] = records.map { recordToMap(it) }.toMutableList()
+                        pendingTokens[key] = newToken
+                        backfilledTypes++
+                    } else {
+                        val merged = (withoutId + byId.values)
+                            .filter { recordInstant(it)?.isBefore(cutoff) != true }
+                            .sortedBy { recordInstant(it)?.toEpochMilli() ?: Long.MAX_VALUE }
+                        recordsByType[name] = merged.toMutableList()
+                        pendingTokens[key] = token
+                    }
+                }
+
+                recordsByType[name] = recordsByType[name].orEmpty()
+                    .filter { recordInstant(it)?.isBefore(cutoff) != true }
+                    .sortedBy { recordInstant(it)?.toEpochMilli() ?: Long.MAX_VALUE }
+                    .toMutableList()
+                onProgress("raw[$name] cached=${recordsByType[name]?.size ?: 0}")
             } catch (e: SecurityException) {
-                recordsByType[name] = emptyList()
+                recordsByType[name] = mutableListOf()
                 errorsByType[name] = "Permission not granted"
+                removeTokens += key
                 onProgress("raw[$name] security error")
             } catch (e: Exception) {
-                recordsByType[name] = emptyList()
                 errorsByType[name] = e.message ?: e.javaClass.simpleName
                 onProgress("raw[$name] error=${e.javaClass.simpleName}: ${e.message}")
             }
         }
 
-        return RawExport(recordsByType, errorsByType)
+        RawCacheStore.save(context, recordsByType)
+        changesPrefs.edit().apply {
+            pendingTokens.forEach { (key, token) -> putString(key, token) }
+            removeTokens.forEach { remove(it) }
+        }.commit()
+
+        val mode = when {
+            !cacheUsable -> "backfill_7d"
+            backfilledTypes > 0 && usedDelta -> "delta_with_recovery"
+            backfilledTypes > 0 -> "backfill_7d"
+            else -> "delta"
+        }
+        return RawExport(
+            records = recordsByType.mapValues { it.value.toList() },
+            errors = errorsByType,
+            mode = mode,
+            changesApplied = changesApplied,
+            backfilledTypes = backfilledTypes,
+        )
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -477,9 +605,26 @@ class HealthConnectManager(private val context: Context) {
             )
             allRecords += response.records
             pageToken = response.pageToken
-        } while (pageToken != null && allRecords.size < MAX_RECORDS_PER_TYPE)
+        } while (!pageToken.isNullOrEmpty())
 
-        return allRecords.take(MAX_RECORDS_PER_TYPE)
+        return allRecords
+    }
+
+    private fun changesTokenKey(recordTypeName: String): String =
+        "$CHANGES_TOKEN_PREFIX$recordTypeName"
+
+    private fun recordId(record: Map<String, Any?>): String? {
+        val metadata = record["metadata"] as? Map<*, *> ?: return null
+        return metadata["id"] as? String
+    }
+
+    private fun recordInstant(record: Map<String, Any?>): Instant? {
+        for (key in listOf("endTime", "time", "startTime")) {
+            val raw = record[key] as? String ?: continue
+            val parsed = runCatching { Instant.parse(raw) }.getOrNull()
+            if (parsed != null) return parsed
+        }
+        return null
     }
 
     private fun recordToMap(record: Record): Map<String, Any?> {
@@ -603,10 +748,12 @@ class HealthConnectManager(private val context: Context) {
     }
 
     companion object {
-        private const val EXPORT_HISTORY_DAYS = 30L
+        private const val ROLLING_RAW_DAYS = 7L
         private const val PAGE_SIZE = 500
-        private const val MAX_RECORDS_PER_TYPE = 2_000
+        private const val CHANGES_PAGE_SIZE = 1000
         private const val MAX_SERIALIZATION_DEPTH = 5
+        private const val CHANGES_PREFS = "health_sync_changes"
+        private const val CHANGES_TOKEN_PREFIX = "token_"
         private const val OHEALTH_INTERNATIONAL_PACKAGE = "com.heytap.health.international"
         private const val OHEALTH_PACKAGE = "com.heytap.health"
         private const val GOOGLE_FIT_PACKAGE = "com.google.android.apps.fitness"

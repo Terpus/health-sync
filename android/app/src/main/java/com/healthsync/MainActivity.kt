@@ -194,6 +194,15 @@ class MainActivity : AppCompatActivity() {
                     SyncDiagnostics.memory(appContext, "before extraction")
                     val extracted = healthManager.readTodaySnapshot { message ->
                         SyncDiagnostics.log(appContext, message)
+                        runOnUiThread {
+                            statusText.text = buildString {
+                                appendLine(
+                                    if (toDrive) "Syncing to Google Drive..."
+                                    else "Testing local export..."
+                                )
+                                append(message)
+                            }
+                        }
                     }
                     SyncDiagnostics.memory(appContext, "after extraction")
 
@@ -225,7 +234,9 @@ class MainActivity : AppCompatActivity() {
                         "HR: ${snapshot.heartRateAvg ?: "--"} bpm\n" +
                         "Calories: ${snapshot.caloriesTotal ?: "--"} kcal\n" +
                         "Sleep: ${snapshot.sleepDurationMinutes?.let { "${it / 60}h ${it % 60}m" } ?: "--"}\n" +
-                        "Raw records: $rawRecordCount across $rawTypeCount types\n" +
+                        "Raw: $rawRecordCount records / $rawTypeCount types / 7 days\n" +
+                        "Raw sync: ${snapshot.rawSyncMode}; changes=${snapshot.rawChangesApplied}; " +
+                        "backfilled types=${snapshot.rawBackfilledTypes}\n" +
                         "Diagnostics: ${SyncDiagnostics.file(appContext).absolutePath}"
                 )
             } catch (e: CancellationException) {

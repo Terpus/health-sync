@@ -25,7 +25,6 @@ import java.time.LocalDate
 object DriveClient {
 
     private const val FILE_NAME = "health_data.json"
-    private const val MAX_HISTORY_DAYS = 30L
     private const val PREFS = "health_sync"
     private const val KEY_FILE_URI = "drive_file_uri"
 
@@ -175,14 +174,13 @@ object DriveClient {
     private fun mergeEntry(existing: JSONObject, newEntry: JSONObject, snapshot: HealthSnapshot): JSONObject {
         val snapshots = existing.optJSONArray("snapshots") ?: org.json.JSONArray()
         val today = newEntry.getString("date")
-        val cutoff = LocalDate.now().minusDays(MAX_HISTORY_DAYS).toString()
 
         val kept = org.json.JSONArray()
         for (i in 0 until snapshots.length()) {
             val entry = snapshots.getJSONObject(i)
             val date = entry.optString("date")
-            // Drop today's old entry (will be replaced) and entries older than cutoff
-            if (date != today && date >= cutoff) kept.put(entry)
+            // Compact daily summaries are cheap: retain history and only replace today's entry.
+            if (date != today) kept.put(entry)
         }
         kept.put(newEntry)
 
@@ -375,6 +373,12 @@ object DriveClient {
             put("summary_sources", toJsonValue(snapshot.summarySources))
             put("summary_data_origins", toJsonValue(snapshot.summaryDataOrigins))
             put("summary_method", "Health Connect aggregate API with per-metric source selection. OHealth is preferred when it has that metric, then configured fallbacks such as Google Fit; raw records remain typed by source record.")
+            put("raw_sync", JSONObject().apply {
+                put("mode", snapshot.rawSyncMode)
+                put("rolling_window_days", 7)
+                put("changes_applied", snapshot.rawChangesApplied)
+                put("backfilled_types", snapshot.rawBackfilledTypes)
+            })
             put("analysis_guidance", JSONObject().apply {
                 put("daily_totals_authoritative_source", "Use the summary fields in this object for daily totals and summary_sources to see which app supplied each metric.")
                 put("raw_records_warning", "Do not sum raw_records to answer daily totals unless explicitly doing raw-record auditing; raw records can overlap, use UTC timestamps, and may not match app-local day cards.")
