@@ -500,11 +500,11 @@ class HealthConnectManager(private val context: Context) {
                         if (id == null) withoutId += record else byId[id] = record
                     }
 
-                    var token = existingToken
+                    var token: String = existingToken
                     var tokenExpired = false
                     var hasMore: Boolean
                     do {
-                        val response = client.getChanges(token, CHANGES_PAGE_SIZE)
+                        val response = client.getChanges(token)
                         if (response.changesTokenExpired) {
                             tokenExpired = true
                             break
@@ -751,7 +751,6 @@ class HealthConnectManager(private val context: Context) {
     companion object {
         private const val ROLLING_RAW_DAYS = 7L
         private const val PAGE_SIZE = 500
-        private const val CHANGES_PAGE_SIZE = 1000
         private const val MAX_SERIALIZATION_DEPTH = 5
         private const val CHANGES_PREFS = "health_sync_changes"
         private const val CHANGES_TOKEN_PREFIX = "token_"
