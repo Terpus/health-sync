@@ -28,6 +28,14 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
+      - name: Restore stable debug signing key
+        shell: bash
+        env:
+          HEALTHSYNC_DEBUG_KEYSTORE_B64: ${{ secrets.HEALTHSYNC_DEBUG_KEYSTORE_B64 }}
+        run: |
+          test -n "$HEALTHSYNC_DEBUG_KEYSTORE_B64"
+          printf '%s' "$HEALTHSYNC_DEBUG_KEYSTORE_B64" | base64 --decode > android/app/debug.keystore
+
       - name: Build debug APK
         working-directory: android
         run: gradle assembleDebug
