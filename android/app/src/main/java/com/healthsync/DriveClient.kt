@@ -360,6 +360,7 @@ object DriveClient {
     }
 
     private fun snapshotToJson(snapshot: HealthSnapshot, includeRawRecords: Boolean): JSONObject {
+        val journalSummary = JournalHealthSummaryBuilder.build(snapshot)
         return JSONObject().apply {
             put("date", LocalDate.now().toString())
             put("recorded_at", snapshot.recordedAt)
@@ -379,8 +380,9 @@ object DriveClient {
                 put("changes_applied", snapshot.rawChangesApplied)
                 put("backfilled_types", snapshot.rawBackfilledTypes)
             })
+            put("journal_summary", toJsonValue(journalSummary))
             put("analysis_guidance", JSONObject().apply {
-                put("daily_totals_authoritative_source", "Use the summary fields in this object for daily totals and summary_sources to see which app supplied each metric.")
+                put("daily_totals_authoritative_source", "Use journal_summary for detailed journal/Notion ingestion. Top-level daily totals remain a compact compatibility view; summary_sources identifies their selected origins.")
                 put("raw_records_warning", "Do not sum raw_records to answer daily totals unless explicitly doing raw-record auditing; raw records can overlap, use UTC timestamps, and may not match app-local day cards.")
                 put("timezone_rule", "For user-facing sleep and day-level answers, prefer local fields and local-day summaries over UTC timestamps ending in Z.")
                 put("source_rule", "Source priority is selected independently per metric. OHealth is preferred when it has data for that metric; Google Fit and other origins are fallbacks.")
@@ -403,13 +405,15 @@ object DriveClient {
             }
             snapshot.activeMinutes?.let { put("exercise_session_minutes", it) }
             if (snapshot.sleepDurationMinutes != null) {
+                val detailedSleep = journalSummary["sleep"] as? Map<*, *>
                 put("sleep", JSONObject().apply {
-                    put("duration_hours", Math.round(snapshot.sleepDurationMinutes / 60.0 * 10) / 10.0)
+                    put("duration_minutes", snapshot.sleepDurationMinutes)
+                    put("duration_hours", Math.round(snapshot.sleepDurationMinutes / 60.0 * 100) / 100.0)
                     snapshot.sleepDate?.let { put("sleep_date_local", it) }
-                    snapshot.sleepStart?.let { put("start_local", it) }
-                    snapshot.sleepEnd?.let { put("end_local", it) }
-                    snapshot.sleepStartUtc?.let { put("start_utc", it) }
-                    snapshot.sleepEndUtc?.let { put("end_utc", it) }
+                    detailedSleep?.get("session_count")?.let { put("session_count", it) }
+                    detailedSleep?.get("first_start_local")?.let { put("first_start_local", it) }
+                    detailedSleep?.get("last_end_local")?.let { put("last_end_local", it) }
+                    detailedSleep?.get("sessions")?.let { put("sessions", toJsonValue(it)) }
                     snapshot.sleepStages?.let { put("stages_minutes", JSONObject(it as Map<*, *>)) }
                 })
             }

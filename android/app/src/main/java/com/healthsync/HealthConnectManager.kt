@@ -769,6 +769,7 @@ class HealthConnectManager(private val context: Context) {
         // Per-record overrides make source selection configurable without changing aggregation logic.
         // If a future smart scale writes directly to Health Connect, add its package here.
         private val SOURCE_PRIORITY_BY_RECORD_TYPE: Map<KClass<out Record>, List<String>> = mapOf(
+            BloodPressureRecord::class to (listOf(GOOGLE_FIT_PACKAGE) + OHEALTH_PACKAGES),
             WeightRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),
             BodyFatRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),
             BodyWaterMassRecord::class to (listOf(BODY_DIARY_PACKAGE) + OHEALTH_PACKAGES + GOOGLE_FIT_PACKAGE),

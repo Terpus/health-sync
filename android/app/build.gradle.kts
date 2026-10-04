@@ -11,8 +11,8 @@ android {
         applicationId = "com.healthsync"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.0.3-weekly-delta"
+        versionCode = 5
+        versionName = "1.0.4-journal-summary"
     }
 
     signingConfigs {

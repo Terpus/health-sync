@@ -231,6 +231,7 @@ class MainActivity : AppCompatActivity() {
                     "Export complete: $destination\n" +
                         "Bytes: ${result.bytesWritten}\n" +
                         "Steps: ${snapshot.steps ?: "--"}\n" +
+                        "Weight: ${JournalHealthSummaryBuilder.latestWeightKg(snapshot)?.let { "$it kg" } ?: "--"}\n" +
                         "HR: ${snapshot.heartRateAvg ?: "--"} bpm\n" +
                         "Calories: ${snapshot.caloriesTotal ?: "--"} kcal\n" +
                         "Sleep: ${snapshot.sleepDurationMinutes?.let { "${it / 60}h ${it % 60}m" } ?: "--"}\n" +
