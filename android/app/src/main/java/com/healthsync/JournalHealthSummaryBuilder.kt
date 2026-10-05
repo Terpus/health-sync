@@ -2,6 +2,7 @@ package com.healthsync
 
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.round
 
@@ -84,13 +85,14 @@ object JournalHealthSummaryBuilder {
         ).withoutNullValues()
 
         return linkedMapOf(
-            "schema_version" to 1,
+            "schema_version" to 2,
             "generated_at" to snapshot.recordedAt,
             "activity_today" to activity,
             "vitals" to vitals,
             "sleep" to sleepSummary(snapshot, today, zone),
             "body" to body,
             "exercise_sessions_today" to exerciseSessions(snapshot, today, zone),
+            "rolling_daily_summaries" to rollingDailySummaries(snapshot, zone),
             "rolling_window_days" to 7,
             "source_policy" to mapOf(
                 "wearable_health" to "OHealth first, then Google Fit/other fallback",
@@ -259,43 +261,105 @@ object JournalHealthSummaryBuilder {
         )
     }
 
-    private fun sleepSummary(
+    private fun rollingDailySummaries(
         snapshot: HealthSnapshot,
-        today: java.time.LocalDate,
         zone: ZoneId
-    ): Map<String, Any?>? {
+    ): List<Map<String, Any?>> {
+        return snapshot.rollingDailySummaries.mapNotNull { daily ->
+            val date = runCatching { LocalDate.parse(daily.date) }.getOrNull()
+                ?: return@mapNotNull null
+            val sleepSessions = sleepSessions(snapshot, date, zone)
+            val exercises = exerciseSessions(snapshot, date, zone)
+
+            linkedMapOf<String, Any?>(
+                "date" to daily.date,
+                "steps" to daily.steps,
+                "calories_active_kcal" to daily.caloriesActive,
+                "calories_total_kcal" to daily.caloriesTotal,
+                "distance_km" to daily.distanceMeters?.let { round2(it / 1000.0) },
+                "exercise_minutes" to daily.exerciseMinutes,
+                "heart_rate_sample_avg_bpm" to daily.heartRateAvg,
+                "heart_rate_resting_bpm" to daily.heartRateResting,
+                "sleep" to if (daily.sleepDurationMinutes != null || sleepSessions.isNotEmpty()) {
+                    linkedMapOf<String, Any?>(
+                        "total_minutes" to daily.sleepDurationMinutes,
+                        "session_count" to sleepSessions.size,
+                        "sessions" to sleepSessions,
+                        "source" to daily.sources["sleep_duration_minutes"],
+                        "duration_source" to if (daily.sleepDurationMinutes != null) {
+                            "Health Connect aggregate"
+                        } else {
+                            null
+                        },
+                        "session_boundaries_source" to if (sleepSessions.isNotEmpty()) {
+                            "raw SleepSessionRecord"
+                        } else {
+                            null
+                        },
+                    ).withoutNullValues()
+                } else {
+                    null
+                },
+                "exercise_sessions" to exercises.takeIf { it.isNotEmpty() },
+                "sources" to daily.sources,
+            ).withoutNullValues()
+        }
+    }
+
+    private fun sleepSessions(
+        snapshot: HealthSnapshot,
+        date: LocalDate,
+        zone: ZoneId
+    ): List<Map<String, Any?>> {
+        val candidates = snapshot.rawRecords["SleepSessionRecord"].orEmpty()
+            .filter { record ->
+                val end = parseInstant(record["endTime"] as? String) ?: return@filter false
+                end.atZone(zone).toLocalDate() == date
+            }
         val records = preferredRecords(
-            snapshot.rawRecords["SleepSessionRecord"].orEmpty(),
+            candidates,
             listOf(OHEALTH, OHEALTH_ALT, GOOGLE_FIT)
-        ).mapNotNull { record ->
+        )
+
+        return records.mapNotNull { record ->
             val start = parseInstant(record["startTime"] as? String) ?: return@mapNotNull null
             val end = parseInstant(record["endTime"] as? String) ?: return@mapNotNull null
-            Triple(record, start, end)
-        }.filter { (_, _, end) -> end.atZone(zone).toLocalDate() == today }
-            .sortedBy { it.second }
-
-        if (records.isEmpty() && snapshot.sleepDurationMinutes == null) return null
-
-        val sessions = records.map { (record, start, end) ->
             linkedMapOf(
                 "start_local" to start.atZone(zone).toString(),
                 "end_local" to end.atZone(zone).toString(),
                 "start_utc" to start.toString(),
                 "end_utc" to end.toString(),
-                "duration_minutes" to Duration.between(start, end).toMinutes(),
+                "session_window_minutes" to Duration.between(start, end).toMinutes(),
                 "source" to source(record),
                 "stages" to record["stages"],
             )
-        }
+        }.sortedBy { it["start_local"]?.toString() }
+    }
 
-        val summedMinutes = sessions.sumOf { (it["duration_minutes"] as? Number)?.toLong() ?: 0L }
+    private fun sleepSummary(
+        snapshot: HealthSnapshot,
+        today: java.time.LocalDate,
+        zone: ZoneId
+    ): Map<String, Any?>? {
+        val sessions = sleepSessions(snapshot, today, zone)
+        if (sessions.isEmpty() && snapshot.sleepDurationMinutes == null) return null
+
+        val summedWindowMinutes = sessions.sumOf {
+            (it["session_window_minutes"] as? Number)?.toLong() ?: 0L
+        }
         return linkedMapOf(
-            "total_minutes" to (snapshot.sleepDurationMinutes ?: summedMinutes),
+            "total_minutes" to (snapshot.sleepDurationMinutes ?: summedWindowMinutes),
             "session_count" to sessions.size,
             "sessions" to sessions,
             "first_start_local" to sessions.firstOrNull()?.get("start_local"),
             "last_end_local" to sessions.lastOrNull()?.get("end_local"),
-            "source" to records.firstOrNull()?.first?.let(::source),
+            "source" to snapshot.summarySources["sleep_duration_minutes"]
+                ?: sessions.firstOrNull()?.get("source"),
+            "duration_source" to if (snapshot.sleepDurationMinutes != null) {
+                "Health Connect aggregate"
+            } else {
+                "summed session windows fallback"
+            },
         ).withoutNullValues()
     }
 
@@ -304,14 +368,18 @@ object JournalHealthSummaryBuilder {
         today: java.time.LocalDate,
         zone: ZoneId
     ): List<Map<String, Any?>> {
+        val candidates = snapshot.rawRecords["ExerciseSessionRecord"].orEmpty()
+            .filter { record ->
+                val end = parseInstant(record["endTime"] as? String) ?: return@filter false
+                end.atZone(zone).toLocalDate() == today
+            }
         val records = preferredRecords(
-            snapshot.rawRecords["ExerciseSessionRecord"].orEmpty(),
+            candidates,
             listOf(OHEALTH, OHEALTH_ALT, GOOGLE_FIT)
         )
         return records.mapNotNull { record ->
             val start = parseInstant(record["startTime"] as? String) ?: return@mapNotNull null
             val end = parseInstant(record["endTime"] as? String) ?: return@mapNotNull null
-            if (end.atZone(zone).toLocalDate() != today) return@mapNotNull null
             linkedMapOf<String, Any?>(
                 "exercise_type" to record["exerciseType"],
                 "title" to record["title"],
@@ -361,8 +429,9 @@ object JournalHealthSummaryBuilder {
         priority: List<String>,
         value: (Map<String, Any?>) -> Double?
     ): Double? {
-        val records = preferredRecords(snapshot.rawRecords[recordType].orEmpty(), priority)
+        val candidates = snapshot.rawRecords[recordType].orEmpty()
             .filter { recordInstant(it)?.atZone(zone)?.toLocalDate() == today }
+        val records = preferredRecords(candidates, priority)
         val values = records.mapNotNull(value)
         if (values.isEmpty()) return null
         return round2(values.sum())

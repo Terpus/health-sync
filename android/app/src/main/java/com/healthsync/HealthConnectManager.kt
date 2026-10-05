@@ -21,6 +21,24 @@ import java.time.ZoneId
 import java.time.ZonedDateTime
 import kotlin.reflect.KClass
 
+data class RollingDailySummary(
+    val date: String,
+    val steps: Long?,
+    val caloriesActive: Long?,
+    val caloriesTotal: Long?,
+    val heartRateAvg: Int?,
+    val heartRateResting: Int?,
+    val distanceMeters: Long?,
+    val exerciseMinutes: Long?,
+    val sleepDurationMinutes: Long?,
+    val selectedOrigin: String?,
+    val sources: Map<String, String>,
+    val dataOrigins: List<String>,
+    val allSourcesSteps: Long?,
+    val allSourcesDistanceMeters: Long?,
+    val allSourcesCaloriesTotal: Long?,
+)
+
 data class HealthSnapshot(
     val deviceId: String,
     val recordedAt: String,
@@ -54,6 +72,7 @@ data class HealthSnapshot(
     val allSourcesSteps: Long?,
     val allSourcesDistanceMeters: Long?,
     val allSourcesCaloriesTotal: Long?,
+    val rollingDailySummaries: List<RollingDailySummary>,
     val rawRecords: Map<String, List<Map<String, Any?>>>,
     val rawSyncMode: String,
     val rawChangesApplied: Int,
@@ -179,7 +198,8 @@ class HealthConnectManager(private val context: Context) {
         onProgress("Health Connect permissions: ${granted.size}/${permissions.size} granted")
 
         val zone = ZoneId.systemDefault()
-        val startOfDay = LocalDate.now().atStartOfDay(zone).toInstant()
+        val today = LocalDate.now(zone)
+        val startOfDay = today.atStartOfDay(zone).toInstant()
         val now = Instant.now()
         val todayRange = TimeRangeFilter.between(startOfDay, now)
         val exportStart = now.minusSeconds(ROLLING_RAW_DAYS * 24 * 60 * 60)
@@ -195,6 +215,14 @@ class HealthConnectManager(private val context: Context) {
         val sleep = readOptional { readSleep(sleepRange) }
         val hrv = readOptional { readHrvStats(sleepRange) }
         val summary = readOptional { readDailySummary(todayRange) }
+        onProgress("Reading authoritative daily aggregates: $ROLLING_RAW_DAYS local days")
+        val rollingDailySummaries = readRollingDailySummaries(
+            today = today,
+            now = now,
+            todaySummary = summary,
+            zone = zone,
+            onProgress = onProgress,
+        )
         onProgress("Updating rolling raw window: $ROLLING_RAW_DAYS days")
         val export = readRawRecords(
             range = exportRange,
@@ -239,6 +267,7 @@ class HealthConnectManager(private val context: Context) {
             allSourcesSteps = summary?.allSourcesSteps,
             allSourcesDistanceMeters = summary?.allSourcesDistanceMeters,
             allSourcesCaloriesTotal = summary?.allSourcesCaloriesTotal,
+            rollingDailySummaries = rollingDailySummaries,
             rawRecords = export.records,
             rawSyncMode = export.mode,
             rawChangesApplied = export.changesApplied,
@@ -360,6 +389,51 @@ class HealthConnectManager(private val context: Context) {
                 ?.inKilocalories
                 ?.toLong()
         )
+    }
+
+    private suspend fun readRollingDailySummaries(
+        today: LocalDate,
+        now: Instant,
+        todaySummary: DailySummary?,
+        zone: ZoneId,
+        onProgress: (String) -> Unit,
+    ): List<RollingDailySummary> {
+        val output = mutableListOf<RollingDailySummary>()
+        for (daysAgo in (ROLLING_RAW_DAYS - 1) downTo 0L) {
+            val date = today.minusDays(daysAgo)
+            val start = date.atStartOfDay(zone).toInstant()
+            val end = if (date == today) now else date.plusDays(1).atStartOfDay(zone).toInstant()
+            val summary = if (date == today && todaySummary != null) {
+                todaySummary
+            } else {
+                readOptional {
+                    readDailySummary(TimeRangeFilter.between(start, end))
+                }
+            } ?: continue
+
+            output += RollingDailySummary(
+                date = date.toString(),
+                steps = summary.steps,
+                caloriesActive = summary.caloriesActive,
+                caloriesTotal = summary.caloriesTotal,
+                heartRateAvg = summary.heartRateAvg,
+                heartRateResting = summary.heartRateResting,
+                distanceMeters = summary.distanceMeters,
+                exerciseMinutes = summary.exerciseMinutes,
+                sleepDurationMinutes = summary.sleepDurationMinutes,
+                selectedOrigin = summary.selectedOrigin,
+                sources = summary.sources,
+                dataOrigins = summary.dataOrigins,
+                allSourcesSteps = summary.allSourcesSteps,
+                allSourcesDistanceMeters = summary.allSourcesDistanceMeters,
+                allSourcesCaloriesTotal = summary.allSourcesCaloriesTotal,
+            )
+            onProgress(
+                "daily[${date}] steps=${summary.steps ?: "--"} " +
+                    "sleep=${summary.sleepDurationMinutes ?: "--"}m"
+            )
+        }
+        return output
     }
 
     private suspend fun aggregateDailyMetrics(
