@@ -355,8 +355,10 @@ object JournalHealthSummaryBuilder {
             "sessions" to sessions,
             "first_start_local" to sessions.firstOrNull()?.get("start_local"),
             "last_end_local" to sessions.lastOrNull()?.get("end_local"),
-            "source" to snapshot.summarySources["sleep_duration_minutes"]
-                ?: sessions.firstOrNull()?.get("source"),
+            "source" to (
+                snapshot.summarySources["sleep_duration_minutes"]
+                    ?: sessions.firstOrNull()?.get("source")
+                ),
             "duration_source" to if (snapshot.sleepDurationMinutes != null) {
                 "Health Connect aggregate"
             } else {
