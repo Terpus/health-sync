@@ -27,6 +27,7 @@ object DriveClient {
     private const val FILE_NAME = "health_data.json"
     private const val PREFS = "health_sync"
     private const val KEY_FILE_URI = "drive_file_uri"
+    private const val SUMMARY_HISTORY_DAYS = 30
 
     data class SyncResult(
         val destination: String,
@@ -174,13 +175,19 @@ object DriveClient {
     private fun mergeEntry(existing: JSONObject, newEntry: JSONObject, snapshot: HealthSnapshot): JSONObject {
         val snapshots = existing.optJSONArray("snapshots") ?: org.json.JSONArray()
         val today = newEntry.getString("date")
+        val cutoff = runCatching {
+            LocalDate.parse(today).minusDays(SUMMARY_HISTORY_DAYS - 1L)
+        }.getOrNull()
 
         val kept = org.json.JSONArray()
         for (i in 0 until snapshots.length()) {
             val entry = snapshots.getJSONObject(i)
             val date = entry.optString("date")
-            // Compact daily summaries are cheap: retain history and only replace today's entry.
-            if (date != today) kept.put(entry)
+            if (date == today) continue
+
+            val parsed = runCatching { LocalDate.parse(date) }.getOrNull()
+            val withinRetention = cutoff == null || parsed == null || !parsed.isBefore(cutoff)
+            if (withinRetention) kept.put(entry)
         }
         kept.put(newEntry)
 
@@ -384,7 +391,9 @@ object DriveClient {
             put("analysis_guidance", JSONObject().apply {
                 put("daily_totals_authoritative_source", "For activity/vitals today use journal_summary.activity_today/vitals. For historical activity totals use journal_summary.rolling_daily_summaries; those totals are queried directly from Health Connect per local day with per-metric source selection.")
                 put("sleep_semantics", "Sleep is deliberately not reduced to one authoritative total. health_connect_aggregate_minutes is the Health Connect local-day aggregate; session_window_union_minutes is the deduplicated union of source-prioritized SleepSessionRecord windows. Neither is guaranteed to equal OHealth UI actual-sleep time when awake/stage detail is not exported.")
-                put("historical_session_details", "Sleep session boundaries are source-prioritized raw SleepSessionRecord intervals normalized by interval union; overlapping or nested sessions are not double-counted. Exercise session boundaries remain source-prioritized raw records.")
+                put("exercise_semantics", "Exercise health_connect_aggregate_minutes and raw session_window_union_minutes are separate observations. Session windows include pauses and must not be substituted for the Health Connect aggregate.")
+                put("historical_session_details", "Sleep session boundaries are source-prioritized raw SleepSessionRecord intervals normalized by interval union; overlapping or nested sessions are not double-counted. Exercise session windows are source-prioritized raw records and are unioned only for comparison with the aggregate.")
+                put("data_quality", "journal_summary.data_quality contains explicit warnings for current-day fallback sources, stale heart-rate freshness, aggregate/session mismatches, and raw extraction failures.")
                 put("rolling_day_basis", "rolling_daily_summaries use local calendar-day aggregate ranges. Sleep sessions are attached by their local end date; journal waking-day attribution may differ and should be handled by the journal layer.")
                 put("raw_records_warning", "Do not sum raw_records to answer daily totals unless explicitly doing raw-record auditing; raw records can overlap within one origin and across origins, use UTC timestamps, and may not match app-local day cards.")
                 put("timezone_rule", "For user-facing sleep and day-level answers, prefer local fields and local-day summaries over UTC timestamps ending in Z.")

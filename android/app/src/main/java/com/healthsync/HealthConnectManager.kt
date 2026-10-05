@@ -93,18 +93,14 @@ class HealthConnectManager(private val context: Context) {
         context.getSharedPreferences(CHANGES_PREFS, Context.MODE_PRIVATE)
     }
 
+    // Keep the Health Connect surface intentionally narrow: only data used by
+    // journal summaries, wearable/activity audit, body measurements, and BP.
     private val supportedRecordTypes: List<KClass<out Record>> = listOf(
         ActiveCaloriesBurnedRecord::class,
-        BasalBodyTemperatureRecord::class,
-        BasalMetabolicRateRecord::class,
-        BloodGlucoseRecord::class,
         BloodPressureRecord::class,
         BodyFatRecord::class,
-        BodyTemperatureRecord::class,
         BodyWaterMassRecord::class,
         BoneMassRecord::class,
-        CervicalMucusRecord::class,
-        CyclingPedalingCadenceRecord::class,
         DistanceRecord::class,
         ElevationGainedRecord::class,
         ExerciseSessionRecord::class,
@@ -112,20 +108,10 @@ class HealthConnectManager(private val context: Context) {
         HeartRateRecord::class,
         HeartRateVariabilityRmssdRecord::class,
         HeightRecord::class,
-        HydrationRecord::class,
-        IntermenstrualBleedingRecord::class,
         LeanBodyMassRecord::class,
-        MenstruationFlowRecord::class,
-        MenstruationPeriodRecord::class,
-        NutritionRecord::class,
-        OvulationTestRecord::class,
         OxygenSaturationRecord::class,
-        PlannedExerciseSessionRecord::class,
-        PowerRecord::class,
         RespiratoryRateRecord::class,
         RestingHeartRateRecord::class,
-        SexualActivityRecord::class,
-        SkinTemperatureRecord::class,
         SleepSessionRecord::class,
         SpeedRecord::class,
         StepsCadenceRecord::class,
@@ -133,7 +119,6 @@ class HealthConnectManager(private val context: Context) {
         TotalCaloriesBurnedRecord::class,
         Vo2MaxRecord::class,
         WeightRecord::class,
-        WheelchairPushesRecord::class,
     )
 
     val permissions = supportedRecordTypes
@@ -537,6 +522,22 @@ class HealthConnectManager(private val context: Context) {
         val errorsByType = linkedMapOf<String, String>()
         val pendingTokens = linkedMapOf<String, String>()
         val removeTokens = linkedSetOf<String>()
+
+        // App upgrades can narrow the supported record surface. Drop obsolete cached
+        // types and their change tokens so retired permissions do not keep bloating
+        // the raw export forever.
+        val supportedTypeNames = supportedRecordTypes.map { it.java.simpleName }.toSet()
+        recordsByType.keys.filterNot { it in supportedTypeNames }.toList().forEach { staleType ->
+            recordsByType.remove(staleType)
+            removeTokens += changesTokenKey(staleType)
+        }
+        changesPrefs.all.keys
+            .filter { it.startsWith(CHANGES_TOKEN_PREFIX) }
+            .filter {
+                it.removePrefix(CHANGES_TOKEN_PREFIX) !in supportedTypeNames
+            }
+            .forEach { removeTokens += it }
+
         val cutoff = Instant.now().minusSeconds(ROLLING_RAW_DAYS * 24 * 60 * 60)
         var changesApplied = 0
         var backfilledTypes = 0
