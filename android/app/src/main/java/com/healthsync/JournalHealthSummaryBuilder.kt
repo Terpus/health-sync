@@ -273,6 +273,7 @@ object JournalHealthSummaryBuilder {
 
             linkedMapOf<String, Any?>(
                 "date" to daily.date,
+                "date_basis" to "local_calendar_day",
                 "steps" to daily.steps,
                 "calories_active_kcal" to daily.caloriesActive,
                 "calories_total_kcal" to daily.caloriesTotal,
@@ -296,6 +297,7 @@ object JournalHealthSummaryBuilder {
                         } else {
                             null
                         },
+                        "session_assignment" to "end_local_date",
                     ).withoutNullValues()
                 } else {
                     null
