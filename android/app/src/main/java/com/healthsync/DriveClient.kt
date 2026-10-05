@@ -382,8 +382,9 @@ object DriveClient {
             })
             put("journal_summary", toJsonValue(journalSummary))
             put("analysis_guidance", JSONObject().apply {
-                put("daily_totals_authoritative_source", "For today use journal_summary.activity_today/vitals/sleep. For any date in the rolling window use journal_summary.rolling_daily_summaries; those totals are queried directly from Health Connect per local day with per-metric source selection.")
-                put("historical_session_details", "Sleep and exercise session boundaries inside rolling_daily_summaries come from source-prioritized raw records; aggregate daily totals remain authoritative when they differ from summed session windows.")
+                put("daily_totals_authoritative_source", "For activity/vitals today use journal_summary.activity_today/vitals. For historical activity totals use journal_summary.rolling_daily_summaries; those totals are queried directly from Health Connect per local day with per-metric source selection.")
+                put("sleep_semantics", "Sleep is deliberately not reduced to one authoritative total. health_connect_aggregate_minutes is the Health Connect local-day aggregate; session_window_union_minutes is the deduplicated union of source-prioritized SleepSessionRecord windows. Neither is guaranteed to equal OHealth UI actual-sleep time when awake/stage detail is not exported.")
+                put("historical_session_details", "Sleep session boundaries are source-prioritized raw SleepSessionRecord intervals normalized by interval union; overlapping or nested sessions are not double-counted. Exercise session boundaries remain source-prioritized raw records.")
                 put("rolling_day_basis", "rolling_daily_summaries use local calendar-day aggregate ranges. Sleep sessions are attached by their local end date; journal waking-day attribution may differ and should be handled by the journal layer.")
                 put("raw_records_warning", "Do not sum raw_records to answer daily totals unless explicitly doing raw-record auditing; raw records can overlap within one origin and across origins, use UTC timestamps, and may not match app-local day cards.")
                 put("timezone_rule", "For user-facing sleep and day-level answers, prefer local fields and local-day summaries over UTC timestamps ending in Z.")
@@ -406,17 +407,33 @@ object DriveClient {
                 put("distance_health_connect_km", Math.round(it / 1000.0 * 100) / 100.0)
             }
             snapshot.activeMinutes?.let { put("exercise_session_minutes", it) }
-            if (snapshot.sleepDurationMinutes != null) {
-                val detailedSleep = journalSummary["sleep"] as? Map<*, *>
+            val detailedSleep = journalSummary["sleep"] as? Map<*, *>
+            if (detailedSleep != null) {
                 put("sleep", JSONObject().apply {
-                    put("duration_minutes", snapshot.sleepDurationMinutes)
-                    put("duration_hours", Math.round(snapshot.sleepDurationMinutes / 60.0 * 100) / 100.0)
-                    snapshot.sleepDate?.let { put("sleep_date_local", it) }
-                    detailedSleep?.get("session_count")?.let { put("session_count", it) }
-                    detailedSleep?.get("first_start_local")?.let { put("first_start_local", it) }
-                    detailedSleep?.get("last_end_local")?.let { put("last_end_local", it) }
-                    detailedSleep?.get("sessions")?.let { put("sessions", toJsonValue(it)) }
-                    snapshot.sleepStages?.let { put("stages_minutes", JSONObject(it as Map<*, *>)) }
+                    detailedSleep["health_connect_aggregate_minutes"]?.let {
+                        put("health_connect_aggregate_minutes", it)
+                    }
+                    detailedSleep["session_window_union_minutes"]?.let {
+                        put("session_window_union_minutes", it)
+                    }
+                    detailedSleep["aggregate_minus_session_union_minutes"]?.let {
+                        put("aggregate_minus_session_union_minutes", it)
+                    }
+                    detailedSleep["session_count"]?.let { put("session_count", it) }
+                    detailedSleep["raw_session_count_before_dedup"]?.let {
+                        put("raw_session_count_before_dedup", it)
+                    }
+                    detailedSleep["first_start_local"]?.let { put("first_start_local", it) }
+                    detailedSleep["last_end_local"]?.let { put("last_end_local", it) }
+                    detailedSleep["sessions"]?.let { put("sessions", toJsonValue(it)) }
+                    detailedSleep["aggregate_source"]?.let { put("aggregate_source", it) }
+                    detailedSleep["session_boundaries_source"]?.let {
+                        put("session_boundaries_source", it)
+                    }
+                    put(
+                        "semantics",
+                        "Health Connect aggregate and deduplicated session-window union are separate observations; neither is assumed to be actual sleep time."
+                    )
                 })
             }
             if (snapshot.hrvRmssdSampleCount > 0) {

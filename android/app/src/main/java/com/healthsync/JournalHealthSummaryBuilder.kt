@@ -17,6 +17,20 @@ object JournalHealthSummaryBuilder {
     private const val GOOGLE_FIT = "com.google.android.apps.fitness"
     private const val BODY_DIARY = "com.selantoapps.bodydiary"
 
+    private data class SleepWindow(
+        val start: Instant,
+        val end: Instant,
+        val source: String?,
+        val stages: Any?,
+        val mergedRawSessionCount: Int = 1,
+    )
+
+    private data class NormalizedSleepSessions(
+        val sessions: List<Map<String, Any?>>,
+        val rawSessionCount: Int,
+        val unionMinutes: Long,
+    )
+
     fun build(snapshot: HealthSnapshot): Map<String, Any?> {
         val zone = ZoneId.systemDefault()
         val now = runCatching { Instant.parse(snapshot.exportEnd) }.getOrElse { Instant.now() }
@@ -85,7 +99,7 @@ object JournalHealthSummaryBuilder {
         ).withoutNullValues()
 
         return linkedMapOf(
-            "schema_version" to 2,
+            "schema_version" to 3,
             "generated_at" to snapshot.recordedAt,
             "activity_today" to activity,
             "vitals" to vitals,
@@ -268,8 +282,9 @@ object JournalHealthSummaryBuilder {
         return snapshot.rollingDailySummaries.mapNotNull { daily ->
             val date = runCatching { LocalDate.parse(daily.date) }.getOrNull()
                 ?: return@mapNotNull null
-            val sleepSessions = sleepSessions(snapshot, date, zone)
+            val sleep = normalizedSleepSessions(snapshot, date, zone)
             val exercises = exerciseSessions(snapshot, date, zone)
+            val aggregateMinutes = daily.sleepDurationMinutes
 
             linkedMapOf<String, Any?>(
                 "date" to daily.date,
@@ -281,19 +296,25 @@ object JournalHealthSummaryBuilder {
                 "exercise_minutes" to daily.exerciseMinutes,
                 "heart_rate_sample_avg_bpm" to daily.heartRateAvg,
                 "heart_rate_resting_bpm" to daily.heartRateResting,
-                "sleep" to if (daily.sleepDurationMinutes != null || sleepSessions.isNotEmpty()) {
+                "sleep" to if (aggregateMinutes != null || sleep.sessions.isNotEmpty()) {
                     linkedMapOf<String, Any?>(
-                        "total_minutes" to daily.sleepDurationMinutes,
-                        "session_count" to sleepSessions.size,
-                        "sessions" to sleepSessions,
-                        "source" to daily.sources["sleep_duration_minutes"],
-                        "duration_source" to if (daily.sleepDurationMinutes != null) {
-                            "Health Connect aggregate"
+                        "health_connect_aggregate_minutes" to aggregateMinutes,
+                        "session_window_union_minutes" to sleep.unionMinutes.takeIf {
+                            sleep.sessions.isNotEmpty()
+                        },
+                        "aggregate_minus_session_union_minutes" to if (
+                            aggregateMinutes != null && sleep.sessions.isNotEmpty()
+                        ) {
+                            aggregateMinutes - sleep.unionMinutes
                         } else {
                             null
                         },
-                        "session_boundaries_source" to if (sleepSessions.isNotEmpty()) {
-                            "raw SleepSessionRecord"
+                        "session_count" to sleep.sessions.size,
+                        "raw_session_count_before_dedup" to sleep.rawSessionCount,
+                        "sessions" to sleep.sessions,
+                        "aggregate_source" to daily.sources["sleep_duration_minutes"],
+                        "session_boundaries_source" to if (sleep.sessions.isNotEmpty()) {
+                            "raw SleepSessionRecord, normalized by interval union"
                         } else {
                             null
                         },
@@ -308,11 +329,11 @@ object JournalHealthSummaryBuilder {
         }
     }
 
-    private fun sleepSessions(
+    private fun normalizedSleepSessions(
         snapshot: HealthSnapshot,
         date: LocalDate,
         zone: ZoneId
-    ): List<Map<String, Any?>> {
+    ): NormalizedSleepSessions {
         val candidates = snapshot.rawRecords["SleepSessionRecord"].orEmpty()
             .filter { record ->
                 val end = parseInstant(record["endTime"] as? String) ?: return@filter false
@@ -323,19 +344,59 @@ object JournalHealthSummaryBuilder {
             listOf(OHEALTH, OHEALTH_ALT, GOOGLE_FIT)
         )
 
-        return records.mapNotNull { record ->
+        val windows = records.mapNotNull { record ->
             val start = parseInstant(record["startTime"] as? String) ?: return@mapNotNull null
             val end = parseInstant(record["endTime"] as? String) ?: return@mapNotNull null
-            linkedMapOf(
-                "start_local" to start.atZone(zone).toString(),
-                "end_local" to end.atZone(zone).toString(),
-                "start_utc" to start.toString(),
-                "end_utc" to end.toString(),
-                "session_window_minutes" to Duration.between(start, end).toMinutes(),
-                "source" to source(record),
-                "stages" to record["stages"],
+            if (!end.isAfter(start)) return@mapNotNull null
+            SleepWindow(
+                start = start,
+                end = end,
+                source = source(record),
+                stages = record["stages"],
             )
-        }.sortedBy { it["start_local"]?.toString() }
+        }.sortedWith(compareBy<SleepWindow> { it.start }.thenByDescending { it.end })
+
+        if (windows.isEmpty()) {
+            return NormalizedSleepSessions(emptyList(), 0, 0)
+        }
+
+        val merged = mutableListOf<SleepWindow>()
+        windows.forEach { window ->
+            val previous = merged.lastOrNull()
+            if (previous == null || window.start.isAfter(previous.end)) {
+                merged += window
+            } else {
+                merged[merged.lastIndex] = previous.copy(
+                    end = maxOf(previous.end, window.end),
+                    source = previous.source.takeIf { it == window.source },
+                    stages = null,
+                    mergedRawSessionCount =
+                        previous.mergedRawSessionCount + window.mergedRawSessionCount,
+                )
+            }
+        }
+
+        val sessions = merged.map { window ->
+            linkedMapOf<String, Any?>(
+                "start_local" to window.start.atZone(zone).toString(),
+                "end_local" to window.end.atZone(zone).toString(),
+                "start_utc" to window.start.toString(),
+                "end_utc" to window.end.toString(),
+                "session_window_minutes" to Duration.between(window.start, window.end).toMinutes(),
+                "source" to window.source,
+                "merged_raw_session_count" to window.mergedRawSessionCount.takeIf { it > 1 },
+                "stages" to window.stages,
+            ).withoutNullValues()
+        }
+        val unionMinutes = sessions.sumOf {
+            (it["session_window_minutes"] as? Number)?.toLong() ?: 0L
+        }
+
+        return NormalizedSleepSessions(
+            sessions = sessions,
+            rawSessionCount = windows.size,
+            unionMinutes = unionMinutes,
+        )
     }
 
     private fun sleepSummary(
@@ -343,27 +404,34 @@ object JournalHealthSummaryBuilder {
         today: java.time.LocalDate,
         zone: ZoneId
     ): Map<String, Any?>? {
-        val sessions = sleepSessions(snapshot, today, zone)
-        if (sessions.isEmpty() && snapshot.sleepDurationMinutes == null) return null
+        val sleep = normalizedSleepSessions(snapshot, today, zone)
+        val aggregateMinutes = snapshot.sleepDurationMinutes
+        if (sleep.sessions.isEmpty() && aggregateMinutes == null) return null
 
-        val summedWindowMinutes = sessions.sumOf {
-            (it["session_window_minutes"] as? Number)?.toLong() ?: 0L
-        }
         return linkedMapOf(
-            "total_minutes" to (snapshot.sleepDurationMinutes ?: summedWindowMinutes),
-            "session_count" to sessions.size,
-            "sessions" to sessions,
-            "first_start_local" to sessions.firstOrNull()?.get("start_local"),
-            "last_end_local" to sessions.lastOrNull()?.get("end_local"),
-            "source" to (
-                snapshot.summarySources["sleep_duration_minutes"]
-                    ?: sessions.firstOrNull()?.get("source")
-                ),
-            "duration_source" to if (snapshot.sleepDurationMinutes != null) {
-                "Health Connect aggregate"
-            } else {
-                "summed session windows fallback"
+            "health_connect_aggregate_minutes" to aggregateMinutes,
+            "session_window_union_minutes" to sleep.unionMinutes.takeIf {
+                sleep.sessions.isNotEmpty()
             },
+            "aggregate_minus_session_union_minutes" to if (
+                aggregateMinutes != null && sleep.sessions.isNotEmpty()
+            ) {
+                aggregateMinutes - sleep.unionMinutes
+            } else {
+                null
+            },
+            "session_count" to sleep.sessions.size,
+            "raw_session_count_before_dedup" to sleep.rawSessionCount,
+            "sessions" to sleep.sessions,
+            "first_start_local" to sleep.sessions.firstOrNull()?.get("start_local"),
+            "last_end_local" to sleep.sessions.lastOrNull()?.get("end_local"),
+            "aggregate_source" to snapshot.summarySources["sleep_duration_minutes"],
+            "session_boundaries_source" to if (sleep.sessions.isNotEmpty()) {
+                "raw SleepSessionRecord, normalized by interval union"
+            } else {
+                null
+            },
+            "session_assignment" to "end_local_date",
         ).withoutNullValues()
     }
 

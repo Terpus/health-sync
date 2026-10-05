@@ -248,7 +248,10 @@ class HealthConnectManager(private val context: Context) {
             heartRateResting = summary?.heartRateResting,
             distanceMeters = summary?.distanceMeters,
             activeMinutes = summary?.exerciseMinutes,
-            sleepDurationMinutes = summary?.sleepDurationMinutes ?: sleep?.durationMinutes,
+            // Today's sleep total must come only from today's local-day aggregate.
+            // The 24h read below is retained for legacy session metadata/stages, but must
+            // never leak yesterday's sleep duration into a new calendar day.
+            sleepDurationMinutes = summary?.sleepDurationMinutes,
             sleepScore = sleep?.score,
             sleepStart = sleep?.start,
             sleepEnd = sleep?.end,

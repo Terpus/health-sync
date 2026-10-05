@@ -11,8 +11,8 @@ android {
         applicationId = "com.healthsync"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "1.0.8-rolling-daily"
+        versionCode = 10
+        versionName = "1.0.9-sleep-semantics"
     }
 
     signingConfigs {
