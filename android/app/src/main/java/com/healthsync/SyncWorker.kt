@@ -8,6 +8,7 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.work.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
@@ -92,9 +93,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
         suspend fun refreshScheduleIfAlreadyActive(context: Context): Boolean {
             val workManager = WorkManager.getInstance(context)
-            val existing = withContext(Dispatchers.IO) {
-                workManager.getWorkInfosForUniqueWork(WORK_NAME).get()
-            }
+            val existing = workManager.getWorkInfosForUniqueWorkFlow(WORK_NAME).first()
             val isActive = existing.any {
                 it.state == WorkInfo.State.ENQUEUED ||
                     it.state == WorkInfo.State.RUNNING ||
