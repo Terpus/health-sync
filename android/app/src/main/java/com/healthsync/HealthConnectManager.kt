@@ -196,7 +196,12 @@ class HealthConnectManager(private val context: Context) {
         val hrv = readOptional { readHrvStats(sleepRange) }
         val summary = readOptional { readDailySummary(todayRange) }
         onProgress("Updating rolling raw window: $ROLLING_RAW_DAYS days")
-        val export = readRawRecords(exportRange, granted, onProgress)
+        val export = readRawRecords(
+            range = exportRange,
+            grantedPermissions = granted,
+            expectedSleepDurationMinutes = summary?.sleepDurationMinutes,
+            onProgress = onProgress,
+        )
         onProgress("Health Connect extraction complete")
 
         return HealthSnapshot(
@@ -438,6 +443,7 @@ class HealthConnectManager(private val context: Context) {
     private suspend fun readRawRecords(
         range: TimeRangeFilter,
         grantedPermissions: Set<String>,
+        expectedSleepDurationMinutes: Long?,
         onProgress: (String) -> Unit,
     ): RawExport {
         val cacheWasPresent = RawCacheStore.exists(context)
@@ -562,6 +568,53 @@ class HealthConnectManager(private val context: Context) {
             } catch (e: Exception) {
                 errorsByType[name] = e.message ?: e.javaClass.simpleName
                 onProgress("raw[$progress] error=${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+
+        // Health Connect's aggregate and change-feed paths can briefly diverge for
+        // sleep when a provider replaces/revises sessions. If aggregate sleep exists
+        // but our delta cache has no session ending today, force one direct read and
+        // reset only the sleep changes token. This preserves exact boundaries when
+        // the provider exposes them without making up intervals from the aggregate.
+        if ((expectedSleepDurationMinutes ?: 0L) > 0L &&
+            HealthPermission.getReadPermission(SleepSessionRecord::class) in grantedPermissions
+        ) {
+            val sleepName = SleepSessionRecord::class.java.simpleName
+            val zone = ZoneId.systemDefault()
+            val today = LocalDate.now(zone)
+            val hasTodaySleepSession = recordsByType[sleepName].orEmpty().any { record ->
+                recordInstant(record)?.atZone(zone)?.toLocalDate() == today
+            }
+
+            if (!hasTodaySleepSession) {
+                onProgress("raw[$sleepName] aggregate has sleep but session cache is empty; direct refresh")
+                try {
+                    val newToken = client.getChangesToken(
+                        ChangesTokenRequest(recordTypes = setOf(SleepSessionRecord::class))
+                    )
+                    val records = readRecordsUntyped(SleepSessionRecord::class, range)
+                    recordsByType[sleepName] = records.map { recordToMap(it) }
+                        .filter { recordInstant(it)?.isBefore(cutoff) != true }
+                        .sortedBy { recordInstant(it)?.toEpochMilli() ?: Long.MAX_VALUE }
+                        .toMutableList()
+                    pendingTokens[changesTokenKey(sleepName)] = newToken
+                    backfilledTypes++
+
+                    val refreshedHasToday = recordsByType[sleepName].orEmpty().any { record ->
+                        recordInstant(record)?.atZone(zone)?.toLocalDate() == today
+                    }
+                    if (refreshedHasToday) {
+                        errorsByType.remove(sleepName)
+                        onProgress("raw[$sleepName] direct refresh recovered exact session boundaries")
+                    } else {
+                        errorsByType[sleepName] =
+                            "Sleep aggregate is present, but direct SleepSessionRecord read has no session ending today"
+                        onProgress("raw[$sleepName] direct refresh still has no current session boundaries")
+                    }
+                } catch (e: Exception) {
+                    errorsByType[sleepName] = e.message ?: e.javaClass.simpleName
+                    onProgress("raw[$sleepName] direct refresh error=${e.javaClass.simpleName}: ${e.message}")
+                }
             }
         }
 

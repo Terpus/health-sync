@@ -75,9 +75,10 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         fun schedule(context: Context) {
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
+                .setRequiresBatteryNotLow(true)
                 .build()
 
-            val request = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES)
+            val request = PeriodicWorkRequestBuilder<SyncWorker>(2, TimeUnit.HOURS)
                 .setConstraints(constraints)
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
                 .build()
@@ -87,6 +88,20 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
                 ExistingPeriodicWorkPolicy.UPDATE,
                 request
             )
+        }
+
+        suspend fun refreshScheduleIfAlreadyActive(context: Context): Boolean {
+            val workManager = WorkManager.getInstance(context)
+            val existing = withContext(Dispatchers.IO) {
+                workManager.getWorkInfosForUniqueWork(WORK_NAME).get()
+            }
+            val isActive = existing.any {
+                it.state == WorkInfo.State.ENQUEUED ||
+                    it.state == WorkInfo.State.RUNNING ||
+                    it.state == WorkInfo.State.BLOCKED
+            }
+            if (isActive) schedule(context)
+            return isActive
         }
 
         fun runOnce(context: Context) {

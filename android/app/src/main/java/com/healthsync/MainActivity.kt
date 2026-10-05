@@ -64,6 +64,24 @@ class MainActivity : AppCompatActivity() {
 
         refreshStatusDisplay()
 
+        // Migrate an already-running auto-sync schedule from older app versions
+        // (15 min) to the current lower-frequency schedule without requiring the
+        // user to toggle auto sync again after updating the APK.
+        lifecycleScope.launch {
+            runCatching {
+                SyncWorker.refreshScheduleIfAlreadyActive(applicationContext)
+            }.onSuccess { wasActive ->
+                if (wasActive) {
+                    SyncDiagnostics.log(
+                        applicationContext,
+                        "Existing auto-sync schedule refreshed to 2h + battery-not-low"
+                    )
+                }
+            }.onFailure { error ->
+                SyncDiagnostics.error(applicationContext, "refresh_auto_sync_schedule", error)
+            }
+        }
+
         findViewById<Button>(R.id.btnConnectHealth).setOnClickListener {
             lifecycleScope.launch {
                 when (healthManager.availability()) {
@@ -123,8 +141,10 @@ class MainActivity : AppCompatActivity() {
                 SyncWorker.schedule(this@MainActivity)
                 SyncWorker.runOnce(this@MainActivity)
                 requestNotificationPermissionIfNeeded()
-                requestBatteryOptimizationExemption()
-                updateStatus("Auto sync active. Syncing once now, then Android will run background sync about every 15 min.")
+                updateStatus(
+                    "Auto sync active. Syncing once now, then Android will run background sync " +
+                        "about every 2 hours when connected and battery is not low."
+                )
             }
         }
     }
