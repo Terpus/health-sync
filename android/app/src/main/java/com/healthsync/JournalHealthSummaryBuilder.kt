@@ -558,6 +558,8 @@ object JournalHealthSummaryBuilder {
                 "title" to record["title"],
                 "start_local" to start.atZone(zone).toString(),
                 "end_local" to end.atZone(zone).toString(),
+                "start_utc" to start.toString(),
+                "end_utc" to end.toString(),
                 "session_window_minutes" to Duration.between(start, end).toMinutes(),
                 "source" to source(record),
             ).withoutNullValues()
